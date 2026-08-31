@@ -1,0 +1,11 @@
+{
+  "completedAt": "2026-08-24T15:17:52Z",
+  "failures": [
+    {
+      "fileId": "66666666-6666-4666-8666-666666666666",
+      "code": "unavailable_source",
+      "message": "The paired Live Photo video is no longer available from Photos.",
+      "retryable": false
+    }
+  ]
+}

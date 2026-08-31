@@ -1,0 +1,268 @@
+{
+  "policyVersion": 1,
+  "constants": {
+    "separator": "/",
+    "replacement": "_",
+    "maxRelativePathUtf16Units": 239,
+    "collisionSuffixFileIdHexCharacters": 8,
+    "caseComparison": "windowsOrdinalIgnoreCase",
+    "unicodeNormalization": "NFC"
+  },
+  "expressionFormat": "Where a path or expectedPath is omitted, concatenate pathExpression or expectedPathExpression parts in order. A string part is literal; an object part has repeat and count fields.",
+  "sanitizeFilename": [
+    {
+      "id": "ordinary-name",
+      "input": "IMG_1234.HEIC",
+      "expected": "IMG_1234.HEIC"
+    },
+    {
+      "id": "all-forbidden-characters",
+      "input": "a<b>c:d\"e/f\\g|h?i*j.jpg",
+      "expected": "a_b_c_d_e_f_g_h_i_j.jpg"
+    },
+    {
+      "id": "control-characters-one-for-one",
+      "input": "line\u0000break\u001fname.jpg",
+      "expected": "line_break_name.jpg"
+    },
+    {
+      "id": "trim-trailing-ascii-space-and-period",
+      "input": "photo.jpg . .",
+      "expected": "photo.jpg"
+    },
+    {
+      "id": "empty-after-trim",
+      "input": "...   ",
+      "expected": "_"
+    },
+    {
+      "id": "dot-dot",
+      "input": "..",
+      "expected": "_"
+    },
+    {
+      "id": "reserved-without-extension",
+      "input": "con",
+      "expected": "_con"
+    },
+    {
+      "id": "reserved-with-extension-case-insensitive",
+      "input": "COM1.txt",
+      "expected": "_COM1.txt"
+    },
+    {
+      "id": "reserved-prefix-is-not-reserved",
+      "input": "com10.txt",
+      "expected": "com10.txt"
+    },
+    {
+      "id": "reserved-word-as-extension-is-allowed",
+      "input": "annual.con",
+      "expected": "annual.con"
+    },
+    {
+      "id": "unicode-normalized-to-nfc",
+      "input": "Cafe\u0301.jpg",
+      "expected": "Caf\u00e9.jpg"
+    },
+    {
+      "id": "emoji-and-non-ascii-preserved",
+      "input": "\ud83c\udf03 \u6771\u4eac.jpg",
+      "expected": "\ud83c\udf03 \u6771\u4eac.jpg"
+    },
+    {
+      "id": "trailing-nonbreaking-space-preserved",
+      "input": "photo.jpg\u00a0",
+      "expected": "photo.jpg\u00a0"
+    }
+  ],
+  "validateRelativePath": [
+    {
+      "id": "valid-date-layout",
+      "path": "Photos/2026/2026-08/2026-08-23/IMG_1234.HEIC",
+      "valid": true
+    },
+    {
+      "id": "valid-unicode",
+      "path": "Photos/2026/\u6771\u4eac/Caf\u00e9.jpg",
+      "valid": true
+    },
+    {
+      "id": "absolute-posix-style",
+      "path": "/Photos/a.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "drive-qualified",
+      "path": "C:/Photos/a.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "unc",
+      "path": "//server/share/a.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "windows-device-namespace",
+      "path": "\\\\?\\C:\\Photos\\a.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "backslash-separator",
+      "path": "Photos\\2026\\a.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "parent-traversal",
+      "path": "Photos/../a.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "current-directory-segment",
+      "path": "Photos/./a.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "empty-segment",
+      "path": "Photos//a.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "unsanitized-reserved-segment",
+      "path": "Photos/CON/file.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "unsanitized-trailing-period",
+      "path": "Photos/Trip./file.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "unsanitized-illegal-character",
+      "path": "Photos/Trip:2026/file.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "nfd-segment-is-not-canonical",
+      "path": "Photos/Cafe\u0301/file.jpg",
+      "valid": false,
+      "error": "unsafe_path"
+    },
+    {
+      "id": "exactly-239-utf16-units",
+      "pathExpression": [
+        "Photos/",
+        { "repeat": "a", "count": 232 }
+      ],
+      "valid": true
+    },
+    {
+      "id": "240-utf16-units",
+      "pathExpression": [
+        "Photos/",
+        { "repeat": "a", "count": 233 }
+      ],
+      "valid": false,
+      "error": "path_conflict"
+    },
+    {
+      "id": "emoji-count-as-two-utf16-units",
+      "pathExpression": [
+        "Photos/",
+        { "repeat": "\ud83d\ude00", "count": 117 }
+      ],
+      "valid": false,
+      "error": "path_conflict"
+    }
+  ],
+  "shortenRelativePath": [
+    {
+      "id": "no-shortening-at-limit",
+      "fileId": "12345678-1234-4234-8234-1234567890ab",
+      "pathExpression": [
+        "Photos/",
+        { "repeat": "a", "count": 228 },
+        ".jpg"
+      ],
+      "expectedPathExpression": [
+        "Photos/",
+        { "repeat": "a", "count": 228 },
+        ".jpg"
+      ]
+    },
+    {
+      "id": "shorten-ascii-stem-and-preserve-extension",
+      "fileId": "12345678-1234-4234-8234-1234567890ab",
+      "pathExpression": [
+        "Photos/2026/",
+        { "repeat": "a", "count": 240 },
+        ".jpg"
+      ],
+      "expectedPathExpression": [
+        "Photos/2026/",
+        { "repeat": "a", "count": 214 },
+        "~12345678.jpg"
+      ]
+    },
+    {
+      "id": "shorten-with-surrogate-pairs-without-splitting-scalar",
+      "fileId": "abcdef12-1234-4234-8234-1234567890ab",
+      "pathExpression": [
+        "Photos/",
+        { "repeat": "\ud83d\ude00", "count": 120 },
+        ".jpg"
+      ],
+      "expectedPathExpression": [
+        "Photos/",
+        { "repeat": "\ud83d\ude00", "count": 109 },
+        "~abcdef12.jpg"
+      ]
+    },
+    {
+      "id": "parent-path-leaves-no-room-for-stem",
+      "fileId": "12345678-1234-4234-8234-1234567890ab",
+      "pathExpression": [
+        { "repeat": "a", "count": 231 },
+        "/name.jpg"
+      ],
+      "error": "path_conflict"
+    }
+  ],
+  "resolveCaseInsensitiveCollision": [
+    {
+      "id": "case-only-existing-name",
+      "fileId": "33333333-3333-4333-8333-333333333333",
+      "proposedPath": "Photos/IMG_1234.JPG",
+      "existingPaths": ["Photos/img_1234.jpg"],
+      "expectedPath": "Photos/IMG_1234~33333333.JPG"
+    },
+    {
+      "id": "no-collision",
+      "fileId": "33333333-3333-4333-8333-333333333333",
+      "proposedPath": "Photos/IMG_1234.JPG",
+      "existingPaths": ["Photos/IMG_9999.JPG"],
+      "expectedPath": "Photos/IMG_1234.JPG"
+    },
+    {
+      "id": "stable-suffix-also-collides",
+      "fileId": "33333333-3333-4333-8333-333333333333",
+      "proposedPath": "Photos/IMG_1234.JPG",
+      "existingPaths": [
+        "Photos/IMG_1234.JPG",
+        "Photos/IMG_1234~33333333.JPG"
+      ],
+      "error": "path_conflict"
+    }
+  ]
+}

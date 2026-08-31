@@ -1,0 +1,6 @@
+{
+  "code": "hash_mismatch",
+  "message": "The uploaded file did not match its commit checksum.",
+  "retryable": true,
+  "requestId": "12345678-1234-4234-8234-1234567890ab"
+}

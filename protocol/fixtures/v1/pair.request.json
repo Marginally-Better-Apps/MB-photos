@@ -1,0 +1,9 @@
+{
+  "protocolVersion": 1,
+  "token": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq",
+  "client": {
+    "name": "MB Photos for iOS",
+    "version": "0.1.0-beta.1",
+    "instanceId": "99999999-9999-4999-8999-999999999999"
+  }
+}

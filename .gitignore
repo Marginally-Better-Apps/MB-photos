@@ -1,0 +1,81 @@
+# OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor and temporary files
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+*.temp
+*.orig
+.idea/
+
+# Logs and local caches
+*.log
+*.pid
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Xcode / Swift
+DerivedData/
+.build/
+.swiftpm/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+
+# .NET / Visual Studio
+bin/
+obj/
+.vs/
+TestResults/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.binlog
+*.nupkg
+BenchmarkDotNet.Artifacts/
+
+# Build and release artifacts
+artifacts/
+coverage/
+.coverage
+coverage.xml
+htmlcov/
+*.app/
+*.dSYM/
+*.dmg
+*.ipa
+*.xcarchive/
+*.xcresult/
+*.msix
+*.appinstaller
+
+# Local signing material and secrets
+*.p12
+*.pfx
+*.cer
+*.mobileprovision
+*.snk
+.env
+.env.*
+!.env.example
+
+# Local backup/test destinations
+.mbphotos-test/

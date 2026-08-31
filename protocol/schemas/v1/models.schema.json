@@ -1,0 +1,574 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mbphotos.local/schemas/v1/models.schema.json",
+  "title": "MB Photos protocol v1 shared models",
+  "$defs": {
+    "Uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "NullableSha256": {
+      "oneOf": [
+        { "$ref": "#/$defs/Sha256" },
+        { "type": "null" }
+      ]
+    },
+    "NullableDateTime": {
+      "oneOf": [
+        { "type": "string", "format": "date-time" },
+        { "type": "null" }
+      ]
+    },
+    "NullableNonNegativeInteger": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ]
+    },
+    "MediaType": {
+      "type": "string",
+      "enum": ["photo", "video"]
+    },
+    "ResourceType": {
+      "type": "string",
+      "enum": ["photo", "video", "alternatePhoto", "pairedVideo", "audio"]
+    },
+    "ExportProfileKind": {
+      "type": "string",
+      "enum": ["preserveOriginals", "originalsAndCurrentJpegs"]
+    },
+    "ErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_request",
+        "authentication_required",
+        "authentication_invalid",
+        "token_expired",
+        "token_consumed",
+        "protocol_mismatch",
+        "job_not_found",
+        "file_not_found",
+        "job_conflict",
+        "file_conflict",
+        "chunk_conflict",
+        "chunk_out_of_order",
+        "disk_full",
+        "path_conflict",
+        "unsafe_path",
+        "hash_mismatch",
+        "unavailable_source",
+        "network_loss",
+        "changed_destination",
+        "internal_error"
+      ]
+    },
+    "Destination": {
+      "$anchor": "Destination",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destinationId", "displayName", "createdAt", "freeBytes", "pathPolicyVersion"],
+      "properties": {
+        "destinationId": { "$ref": "#/$defs/Uuid" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "freeBytes": { "type": "integer", "minimum": 0 },
+        "pathPolicyVersion": { "const": 1 }
+      }
+    },
+    "ExportProfile": {
+      "$anchor": "ExportProfile",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "profileVersion", "preserveLocation"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/ExportProfileKind" },
+        "profileVersion": { "const": 1 },
+        "preserveLocation": { "type": "boolean" },
+        "jpegRendererVersion": { "type": "string", "minLength": 1, "maxLength": 32 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "originalsAndCurrentJpegs" } }, "required": ["kind"] },
+          "then": { "required": ["jpegRendererVersion"] },
+          "else": { "not": { "required": ["jpegRendererVersion"] } }
+        }
+      ]
+    },
+    "DateRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "type": "string", "format": "date-time" },
+        "end": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Selection": {
+      "$anchor": "Selection",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "assetCount"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["allAccessible", "newOrChanged", "dateRange", "albums", "manual"]
+        },
+        "assetCount": { "type": "integer", "minimum": 0 },
+        "dateRange": { "$ref": "#/$defs/DateRange" },
+        "sourceAlbumIdentifiers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "dateRange" } }, "required": ["kind"] },
+          "then": { "required": ["dateRange"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "albums" } }, "required": ["kind"] },
+          "then": { "required": ["sourceAlbumIdentifiers"] }
+        }
+      ]
+    },
+    "AssetLocation": {
+      "$anchor": "AssetLocation",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["latitude", "longitude"],
+      "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "altitudeMeters": { "type": "number" }
+      }
+    },
+    "RecoveryFingerprint": {
+      "$anchor": "RecoveryFingerprint",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "captureDate",
+        "pixelWidth",
+        "pixelHeight",
+        "durationMilliseconds",
+        "mediaType",
+        "originalFilenames",
+        "resourceByteCounts"
+      ],
+      "properties": {
+        "captureDate": { "$ref": "#/$defs/NullableDateTime" },
+        "pixelWidth": { "type": "integer", "minimum": 0 },
+        "pixelHeight": { "type": "integer", "minimum": 0 },
+        "durationMilliseconds": { "$ref": "#/$defs/NullableNonNegativeInteger" },
+        "mediaType": { "$ref": "#/$defs/MediaType" },
+        "originalFilenames": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "resourceByteCounts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/NullableNonNegativeInteger" }
+        }
+      }
+    },
+    "ExportFile": {
+      "$anchor": "ExportFile",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fileId",
+        "assetId",
+        "kind",
+        "resourceType",
+        "originalFilename",
+        "proposedRelativePath",
+        "byteCount",
+        "sha256",
+        "sourceRevision",
+        "captureDate",
+        "contentType"
+      ],
+      "properties": {
+        "fileId": { "$ref": "#/$defs/Uuid" },
+        "assetId": { "$ref": "#/$defs/Uuid" },
+        "kind": { "type": "string", "enum": ["originalResource", "currentJpeg"] },
+        "resourceType": { "$ref": "#/$defs/ResourceType" },
+        "originalFilename": { "type": "string", "minLength": 1 },
+        "proposedRelativePath": { "type": "string", "minLength": 1, "maxLength": 239 },
+        "byteCount": { "$ref": "#/$defs/NullableNonNegativeInteger" },
+        "sha256": { "$ref": "#/$defs/NullableSha256" },
+        "sourceRevision": { "$ref": "#/$defs/Sha256" },
+        "captureDate": { "$ref": "#/$defs/NullableDateTime" },
+        "contentType": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*$" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "ExportAsset": {
+      "$anchor": "ExportAsset",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "assetId",
+        "sourceLocalIdentifier",
+        "sourceRevision",
+        "mediaType",
+        "mediaSubtypes",
+        "creationDate",
+        "modificationDate",
+        "isEdited",
+        "recoveryFingerprint",
+        "files"
+      ],
+      "properties": {
+        "assetId": { "$ref": "#/$defs/Uuid" },
+        "sourceLocalIdentifier": { "type": "string", "minLength": 1 },
+        "sourceRevision": { "$ref": "#/$defs/Sha256" },
+        "mediaType": { "$ref": "#/$defs/MediaType" },
+        "mediaSubtypes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "panorama",
+              "screenshot",
+              "livePhoto",
+              "depthEffect",
+              "raw",
+              "hdr",
+              "slowMotion",
+              "highFrameRate",
+              "timelapse",
+              "cinematic"
+            ]
+          }
+        },
+        "creationDate": { "$ref": "#/$defs/NullableDateTime" },
+        "modificationDate": { "$ref": "#/$defs/NullableDateTime" },
+        "location": { "$ref": "#/$defs/AssetLocation" },
+        "isEdited": { "type": "boolean" },
+        "recoveryFingerprint": { "$ref": "#/$defs/RecoveryFingerprint" },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/ExportFile" }
+        }
+      }
+    },
+    "AlbumMembership": {
+      "$anchor": "AlbumMembership",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["albumId", "sourceAlbumIdentifier", "albumTitle", "parentAlbumId", "assetId"],
+      "properties": {
+        "albumId": { "$ref": "#/$defs/Uuid" },
+        "sourceAlbumIdentifier": { "type": "string", "minLength": 1 },
+        "albumTitle": { "type": "string", "minLength": 1 },
+        "parentAlbumId": {
+          "oneOf": [
+            { "$ref": "#/$defs/Uuid" },
+            { "type": "null" }
+          ]
+        },
+        "assetId": { "$ref": "#/$defs/Uuid" }
+      }
+    },
+    "ExportJob": {
+      "$anchor": "ExportJob",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocolVersion",
+        "jobId",
+        "createdAt",
+        "sourceTimeZone",
+        "profile",
+        "selection",
+        "assets",
+        "albumMemberships"
+      ],
+      "properties": {
+        "protocolVersion": { "const": 1 },
+        "jobId": { "$ref": "#/$defs/Uuid" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "sourceTimeZone": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "profile": { "$ref": "#/$defs/ExportProfile" },
+        "selection": { "$ref": "#/$defs/Selection" },
+        "assets": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/ExportAsset" }
+        },
+        "albumMemberships": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/AlbumMembership" }
+        }
+      }
+    },
+    "Capabilities": {
+      "$anchor": "Capabilities",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chunkSizeBytes",
+        "maxRelativePathUtf16Units",
+        "pathPolicyVersion",
+        "hashAlgorithm",
+        "sequentialChunksRequired",
+        "supportedProfiles"
+      ],
+      "properties": {
+        "chunkSizeBytes": { "const": 8388608 },
+        "maxRelativePathUtf16Units": { "const": 239 },
+        "pathPolicyVersion": { "const": 1 },
+        "hashAlgorithm": { "const": "sha256" },
+        "sequentialChunksRequired": { "const": true },
+        "supportedProfiles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ExportProfileKind" }
+        }
+      }
+    },
+    "ChunkRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["firstIndex", "lastIndexInclusive"],
+      "properties": {
+        "firstIndex": { "type": "integer", "minimum": 0 },
+        "lastIndexInclusive": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "FileDecision": {
+      "$anchor": "FileDecision",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fileId",
+        "action",
+        "acceptedRelativePath",
+        "nextChunkIndex",
+        "acknowledgedChunks",
+        "reason"
+      ],
+      "properties": {
+        "fileId": { "$ref": "#/$defs/Uuid" },
+        "action": { "type": "string", "enum": ["upload", "skip", "resume", "conflict"] },
+        "acceptedRelativePath": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 239 },
+            { "type": "null" }
+          ]
+        },
+        "nextChunkIndex": { "type": "integer", "minimum": 0 },
+        "acknowledgedChunks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ChunkRange" }
+        },
+        "reason": {
+          "type": "string",
+          "enum": ["new", "verified", "partial", "changed", "pathAdjusted", "unresolvableConflict"]
+        }
+      }
+    },
+    "JobState": {
+      "type": "string",
+      "enum": ["planned", "transferring", "paused", "completed", "completedWithFailures", "abandoned"]
+    },
+    "JobPlan": {
+      "$anchor": "JobPlan",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "jobId", "destination", "state", "decisions", "createdAt", "updatedAt"],
+      "properties": {
+        "protocolVersion": { "const": 1 },
+        "jobId": { "$ref": "#/$defs/Uuid" },
+        "destination": { "$ref": "#/$defs/Destination" },
+        "state": { "$ref": "#/$defs/JobState" },
+        "decisions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/FileDecision" }
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ChunkReceipt": {
+      "$anchor": "ChunkReceipt",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jobId",
+        "fileId",
+        "chunkIndex",
+        "startOffset",
+        "endOffsetExclusive",
+        "byteCount",
+        "chunkSha256",
+        "nextChunkIndex",
+        "receivedAt"
+      ],
+      "properties": {
+        "jobId": { "$ref": "#/$defs/Uuid" },
+        "fileId": { "$ref": "#/$defs/Uuid" },
+        "chunkIndex": { "type": "integer", "minimum": 0 },
+        "startOffset": { "type": "integer", "minimum": 0 },
+        "endOffsetExclusive": { "type": "integer", "minimum": 0 },
+        "byteCount": { "type": "integer", "minimum": 0, "maximum": 8388608 },
+        "chunkSha256": { "$ref": "#/$defs/Sha256" },
+        "nextChunkIndex": { "type": "integer", "minimum": 0 },
+        "receivedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "FileCommitReceipt": {
+      "$anchor": "FileCommitReceipt",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileId", "state", "relativePath", "byteCount", "sha256", "committedAt"],
+      "properties": {
+        "fileId": { "$ref": "#/$defs/Uuid" },
+        "state": { "const": "committed" },
+        "relativePath": { "type": "string", "minLength": 1, "maxLength": 239 },
+        "byteCount": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "#/$defs/Sha256" },
+        "committedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "CompletionCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "assetsPlanned",
+        "filesPlanned",
+        "filesCommitted",
+        "filesSkipped",
+        "filesFailed",
+        "bytesTransferred",
+        "bytesCommitted",
+        "verifiedOriginalFiles"
+      ],
+      "properties": {
+        "assetsPlanned": { "type": "integer", "minimum": 0 },
+        "filesPlanned": { "type": "integer", "minimum": 0 },
+        "filesCommitted": { "type": "integer", "minimum": 0 },
+        "filesSkipped": { "type": "integer", "minimum": 0 },
+        "filesFailed": { "type": "integer", "minimum": 0 },
+        "bytesTransferred": { "type": "integer", "minimum": 0 },
+        "bytesCommitted": { "type": "integer", "minimum": 0 },
+        "verifiedOriginalFiles": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "CompletionFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileId", "code", "message", "retryable"],
+      "properties": {
+        "fileId": { "$ref": "#/$defs/Uuid" },
+        "code": { "$ref": "#/$defs/ErrorCode" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "CompletionReport": {
+      "$anchor": "CompletionReport",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocolVersion",
+        "jobId",
+        "destinationId",
+        "state",
+        "startedAt",
+        "completedAt",
+        "counts",
+        "failures",
+        "reportRelativePath",
+        "manifestRelativePaths"
+      ],
+      "properties": {
+        "protocolVersion": { "const": 1 },
+        "jobId": { "$ref": "#/$defs/Uuid" },
+        "destinationId": { "$ref": "#/$defs/Uuid" },
+        "state": { "type": "string", "enum": ["completed", "completedWithFailures"] },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "counts": { "$ref": "#/$defs/CompletionCounts" },
+        "failures": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CompletionFailure" }
+        },
+        "reportRelativePath": { "type": "string", "minLength": 1, "maxLength": 239 },
+        "manifestRelativePaths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 239 }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "failures": { "minItems": 1 } },
+            "required": ["failures"]
+          },
+          "then": {
+            "properties": {
+              "state": { "const": "completedWithFailures" },
+              "counts": {
+                "properties": { "filesFailed": { "minimum": 1 } }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "state": { "const": "completed" },
+              "counts": {
+                "properties": { "filesFailed": { "const": 0 } }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "AbandonmentReceipt": {
+      "$anchor": "AbandonmentReceipt",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jobId", "state", "removedPartialFiles", "abandonedAt"],
+      "properties": {
+        "jobId": { "$ref": "#/$defs/Uuid" },
+        "state": { "const": "abandoned" },
+        "removedPartialFiles": { "type": "integer", "minimum": 0 },
+        "abandonedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ApiError": {
+      "$anchor": "ApiError",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": { "$ref": "#/$defs/ErrorCode" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "retryable": { "type": "boolean" },
+        "requestId": {
+          "oneOf": [
+            { "$ref": "#/$defs/Uuid" },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MBPhotos.Receiver.Core", "src\MBPhotos.Receiver.Core\MBPhotos.Receiver.Core.csproj", "{D2CF7E80-D76B-4B20-9EE5-BA2EA44961E4}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MBPhotos.Receiver.Wpf", "src\MBPhotos.Receiver.Wpf\MBPhotos.Receiver.Wpf.csproj", "{6E697498-AF8D-4A93-8E01-73353B9299B1}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MBPhotos.Receiver.Tests", "tests\MBPhotos.Receiver.Tests\MBPhotos.Receiver.Tests.csproj", "{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{D2CF7E80-D76B-4B20-9EE5-BA2EA44961E4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D2CF7E80-D76B-4B20-9EE5-BA2EA44961E4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D2CF7E80-D76B-4B20-9EE5-BA2EA44961E4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D2CF7E80-D76B-4B20-9EE5-BA2EA44961E4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6E697498-AF8D-4A93-8E01-73353B9299B1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6E697498-AF8D-4A93-8E01-73353B9299B1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6E697498-AF8D-4A93-8E01-73353B9299B1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6E697498-AF8D-4A93-8E01-73353B9299B1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,17 @@
+{
+  "pair.request.json": "api.schema.json#/$defs/PairRequest",
+  "pair.response.json": "api.schema.json#/$defs/PairResponse",
+  "create-job.request.json": "api.schema.json#/$defs/CreateJobRequest",
+  "create-job.response.json": "api.schema.json#/$defs/CreateJobResponse",
+  "job-status.response.json": "api.schema.json#/$defs/JobStatusResponse",
+  "chunk-receipt.response.json": "api.schema.json#/$defs/UploadChunkResponse",
+  "commit-file.request.json": "api.schema.json#/$defs/CommitFileRequest",
+  "commit-file.response.json": "api.schema.json#/$defs/CommitFileResponse",
+  "complete-job.request.json": "api.schema.json#/$defs/CompleteJobRequest",
+  "complete-job-with-failures.request.json": "api.schema.json#/$defs/CompleteJobRequest",
+  "completion-report.response.json": "api.schema.json#/$defs/CompleteJobResponse",
+  "completion-report-with-failures.response.json": "api.schema.json#/$defs/CompleteJobResponse",
+  "abandon-job.request.json": "api.schema.json#/$defs/AbandonJobRequest",
+  "abandon-job.response.json": "api.schema.json#/$defs/AbandonJobResponse",
+  "api-error.response.json": "api.schema.json#/$defs/ErrorResponse"
+}

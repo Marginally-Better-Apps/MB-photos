@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <!-- Production uses .NET 10. The conditional net7 target exists only so the
+         protocol/storage core can be exercised on the repository's macOS SDK. -->
+    <TargetFramework Condition="$([MSBuild]::VersionGreaterThanOrEquals('$(MSBuildVersion)', '17.14.0'))">net10.0</TargetFramework>
+    <TargetFramework Condition="!$([MSBuild]::VersionGreaterThanOrEquals('$(MSBuildVersion)', '17.14.0'))">net7.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <RootNamespace>MBPhotos.Receiver</RootNamespace>
+    <AssemblyName>MBPhotos.Receiver.Core</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net7.0'">
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="7.0.20" />
+  </ItemGroup>
+</Project>

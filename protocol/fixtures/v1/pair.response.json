@@ -1,0 +1,23 @@
+{
+  "protocolVersion": 1,
+  "sessionToken": "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg",
+  "receiverRunId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "destination": {
+    "destinationId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    "displayName": "Photo Backup (D:)",
+    "createdAt": "2026-08-24T15:01:10Z",
+    "freeBytes": 812345678901,
+    "pathPolicyVersion": 1
+  },
+  "capabilities": {
+    "chunkSizeBytes": 8388608,
+    "maxRelativePathUtf16Units": 239,
+    "pathPolicyVersion": 1,
+    "hashAlgorithm": "sha256",
+    "sequentialChunksRequired": true,
+    "supportedProfiles": [
+      "preserveOriginals",
+      "originalsAndCurrentJpegs"
+    ]
+  }
+}

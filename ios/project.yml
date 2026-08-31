@@ -1,0 +1,92 @@
+name: MBPhotos
+options:
+  minimumXcodeGenVersion: 2.44.1
+  deploymentTarget:
+    iOS: "18.0"
+  groupSortPosition: top
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+    ENABLE_STRICT_OBJC_MSGSEND: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+    CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED: YES
+packages:
+  GRDB:
+    url: https://github.com/groue/GRDB.swift.git
+    exactVersion: 7.10.0
+targets:
+  MBPhotos:
+    type: application
+    platform: iOS
+    sources:
+      - path: MBPhotos
+        excludes:
+          - Info.plist
+    info:
+      path: MBPhotos/Info.plist
+      properties:
+        CFBundleDisplayName: MB Photos
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        NSCameraUsageDescription: Scan the one-time code shown by the MB Photos Windows receiver. Camera images are not stored.
+        NSLocalNetworkUsageDescription: Transfer your selected photos directly to your Windows PC over your private local network.
+        NSPhotoLibraryUsageDescription: Read and organize your photos and videos. Items you explicitly confirm for removal are moved to Apple Photos’ Recently Deleted collection.
+        PHPhotoLibraryPreventAutomaticLimitedAccessAlert: true
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.marginallybetter.photos.refresh
+          - com.marginallybetter.photos.analysis.processing
+          - com.marginallybetter.photos.maintenance.processing
+          - com.marginallybetter.photos.continued.*
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - fetch
+          - processing
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.marginallybetter.photos
+        PRODUCT_NAME: MB Photos
+        PRODUCT_MODULE_NAME: MBPhotos
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - sdk: Photos.framework
+      - sdk: PhotosUI.framework
+      - sdk: AVFoundation.framework
+      - sdk: BackgroundTasks.framework
+      - sdk: CoreImage.framework
+      - sdk: ImageIO.framework
+      - sdk: MetricKit.framework
+      - sdk: Security.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: Vision.framework
+      - sdk: VisionKit.framework
+      - package: GRDB
+    scheme:
+      testTargets:
+        - MBPhotosTests
+      gatherCoverageData: true
+  MBPhotosTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: MBPhotosTests
+    dependencies:
+      - target: MBPhotos
+      - package: GRDB
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.marginallybetter.photos.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/MB Photos.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/MB Photos"
+        BUNDLE_LOADER: "$(TEST_HOST)"
