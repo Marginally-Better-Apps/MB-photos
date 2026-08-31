@@ -32,11 +32,24 @@ public sealed class EphemeralCertificate : IDisposable
         san.AddDnsName("localhost");
         request.CertificateExtensions.Add(san.Build());
 
-        var generated = request.CreateSelfSigned(
+        using var generated = request.CreateSelfSigned(
             DateTimeOffset.UtcNow.AddMinutes(-5),
             DateTimeOffset.UtcNow.AddDays(2));
         var export = generated.Export(X509ContentType.Pfx);
-        var certificate = new X509Certificate2(export, (string?)null, X509KeyStorageFlags.EphemeralKeySet);
+        // Windows Schannel cannot use a certificate backed by an ephemeral
+        // private key. Without PersistKeySet, this temporary user key is
+        // removed when the certificate is disposed at receiver shutdown.
+        var keyStorageFlags = OperatingSystem.IsWindows()
+            ? X509KeyStorageFlags.UserKeySet
+            : X509KeyStorageFlags.EphemeralKeySet;
+#if NET9_0_OR_GREATER
+        var certificate = X509CertificateLoader.LoadPkcs12(
+            export,
+            password: null,
+            keyStorageFlags);
+#else
+        var certificate = new X509Certificate2(export, (string?)null, keyStorageFlags);
+#endif
         var fingerprint = Convert.ToHexString(SHA256.HashData(certificate.RawData)).ToLowerInvariant();
         return new EphemeralCertificate(certificate, fingerprint);
     }

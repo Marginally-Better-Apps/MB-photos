@@ -1215,6 +1215,8 @@ public sealed class Ledger : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
+        using var connection = new SqliteConnection(connectionString);
+        SqliteConnection.ClearPool(connection);
         gate.Dispose();
         return ValueTask.CompletedTask;
     }

@@ -162,6 +162,7 @@ public sealed class ManifestWriter
                 DataSource = path,
                 Mode = SqliteOpenMode.ReadWriteCreate,
                 Cache = SqliteCacheMode.Private,
+                Pooling = false,
             }.ToString());
             connection.Open();
             using (var command = connection.CreateCommand())

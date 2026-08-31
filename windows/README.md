@@ -41,7 +41,7 @@ The script publishes `MBPhotosReceiver.exe`, signs it with SHA-256 and an RFC 31
 ## Receiver behavior
 
 - Choosing an uninitialized folder requires the explicit initialization checkbox. Nonempty reserved `Metadata`, `Reports`, or `.mbphotos` paths are rejected and left untouched.
-- Each process run creates a self-signed in-memory certificate, a 256-bit five-minute single-use pairing token, and a process-lifetime bearer session. Tokens, filenames, album titles, and location values are redacted from diagnostics.
+- Each process run creates a self-signed process-lifetime certificate, a 256-bit five-minute single-use pairing token, and a process-lifetime bearer session. Windows uses a temporary current-user key container because Schannel cannot serve TLS from an ephemeral private key; it is not persisted beyond certificate disposal. Tokens, filenames, album titles, and location values are redacted from diagnostics.
 - Uploads use sequential 8 MiB chunks. Receipts, the first observed total for unknown-size outputs, and original receipt timestamps are durable in SQLite. Retrying an acknowledged chunk is idempotent.
 - Each chunk and committed file is SHA-256 verified. Final files are moved atomically from `.mbphotos/partial/{jobId}`; a mismatch is quarantined until retry or abandonment.
 - Crash reconciliation truncates bytes flushed without a ledger receipt and recognizes a hash-valid final file moved before its commit transaction.

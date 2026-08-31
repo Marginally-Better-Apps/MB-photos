@@ -287,14 +287,7 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
                     catch (Exception exception)
                     {
                         lastWriteFailure = exception;
-                        if (writer is not null)
-                        {
-                            await writer.DisposeAsync().ConfigureAwait(false);
-                        }
-                        else if (stream is not null)
-                        {
-                            await stream.DisposeAsync().ConfigureAwait(false);
-                        }
+                        await DisposeStreamsAsync(writer, stream).ConfigureAwait(false);
                         stream = null;
                         writer = null;
                         entriesSinceFlush = 0;
@@ -340,14 +333,7 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
         }
         finally
         {
-            if (writer is not null)
-            {
-                await writer.DisposeAsync().ConfigureAwait(false);
-            }
-            else if (stream is not null)
-            {
-                await stream.DisposeAsync().ConfigureAwait(false);
-            }
+            await DisposeStreamsAsync(writer, stream).ConfigureAwait(false);
 
             List<LogCommand> pending;
             lock (queueSync)
@@ -372,14 +358,7 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
         if (stream is null || writer is null || stream.Length + lineBytes > MaximumLogBytes)
         {
             var rotateCurrent = stream is not null && writer is not null;
-            if (writer is not null)
-            {
-                await writer.DisposeAsync().ConfigureAwait(false);
-            }
-            else if (stream is not null)
-            {
-                await stream.DisposeAsync().ConfigureAwait(false);
-            }
+            await DisposeStreamsAsync(writer, stream).ConfigureAwait(false);
 
             if (File.Exists(logPath) && (rotateCurrent || new FileInfo(logPath).Length >= MaximumLogBytes))
             {
@@ -398,6 +377,24 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
 
         await writer.WriteLineAsync(line.AsMemory()).ConfigureAwait(false);
         return (stream, writer);
+    }
+
+    private static async ValueTask DisposeStreamsAsync(StreamWriter? writer, FileStream? stream)
+    {
+        try
+        {
+            if (writer is not null)
+            {
+                await writer.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            if (stream is not null)
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+            }
+        }
     }
 
     private static string Redact(string message)

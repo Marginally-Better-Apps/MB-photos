@@ -19,7 +19,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        app = (App)Application.Current;
+        app = (App)System.Windows.Application.Current;
         lifecycle = app.Lifecycle;
         activityFeed = app.ActivityFeed;
         activityDispatcher = new ReceiverActivityDispatcher(
@@ -58,7 +58,7 @@ public partial class MainWindow : Window
         var selected = DestinationTextBox.Text.Trim();
         if (string.IsNullOrEmpty(selected))
         {
-            MessageBox.Show(this, "Choose a backup folder first.", "Backup folder required", MessageBoxButton.OK, MessageBoxImage.Information);
+            System.Windows.MessageBox.Show(this, "Choose a backup folder first.", "Backup folder required", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
@@ -130,7 +130,7 @@ public partial class MainWindow : Window
         }
         catch (Exception exception)
         {
-            MessageBox.Show(this, exception.Message, "Could not open backup folder", MessageBoxButton.OK, MessageBoxImage.Error);
+            System.Windows.MessageBox.Show(this, exception.Message, "Could not open backup folder", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
@@ -162,11 +162,11 @@ public partial class MainWindow : Window
         var receiver = snapshot.Receiver;
         if (receiver is null || snapshot.State != ReceiverLifecycleState.Running)
         {
-            MessageBox.Show(this, "Start the receiver before exporting its diagnostics.", "No diagnostics", MessageBoxButton.OK, MessageBoxImage.Information);
+            System.Windows.MessageBox.Show(this, "Start the receiver before exporting its diagnostics.", "No diagnostics", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
-        var dialog = new SaveFileDialog
+        var dialog = new Microsoft.Win32.SaveFileDialog
         {
             Title = "Export redacted diagnostics",
             FileName = $"mbphotos-receiver-{DateTime.Now:yyyyMMdd-HHmmss}.log",
@@ -180,7 +180,7 @@ public partial class MainWindow : Window
             }
             catch (Exception exception)
             {
-                MessageBox.Show(this, exception.Message, "Could not export diagnostics", MessageBoxButton.OK, MessageBoxImage.Error);
+                System.Windows.MessageBox.Show(this, exception.Message, "Could not export diagnostics", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
     }

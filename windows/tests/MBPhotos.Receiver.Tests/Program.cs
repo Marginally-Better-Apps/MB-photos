@@ -904,7 +904,11 @@ internal static class Program
         var now = DateTimeOffset.UtcNow.ToUniversalTime().ToString("O");
         try
         {
-            await using (var connection = new SqliteConnection($"Data Source={databasePath}"))
+            await using (var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = databasePath,
+                Pooling = false,
+            }.ToString()))
             {
                 await connection.OpenAsync();
                 var command = connection.CreateCommand();
@@ -989,7 +993,11 @@ internal static class Program
             Equal(10L, stats.BytesCommitted);
             Equal(1, stats.VerifiedOriginalFiles);
 
-            await using var verify = new SqliteConnection($"Data Source={databasePath}");
+            await using var verify = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = databasePath,
+                Pooling = false,
+            }.ToString());
             await verify.OpenAsync();
             var versionCommand = verify.CreateCommand();
             versionCommand.CommandText = "PRAGMA user_version";
@@ -1031,7 +1039,8 @@ internal static class Program
             }
 
             Equal("receiver-owned metadata", await File.ReadAllTextAsync(metadataPath));
-            True(destinationBefore.SequenceEqual(await File.ReadAllBytesAsync(destinationPath)), "destination.json must not be modified");
+            var destinationAfter = await File.ReadAllBytesAsync(destinationPath);
+            True(destinationBefore.SequenceEqual(destinationAfter), "destination.json must not be modified");
             Equal("outside backup root", await File.ReadAllTextAsync(outsideSentinel));
             True(!File.Exists(Path.Combine(outside, "escape.jpg")));
         }
@@ -1518,6 +1527,7 @@ internal static class Program
         {
             DataSource = databasePath,
             Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false,
         }.ToString());
         await connection.OpenAsync();
         using var transaction = connection.BeginTransaction();
