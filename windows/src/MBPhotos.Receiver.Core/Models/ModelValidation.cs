@@ -8,6 +8,17 @@ public static partial class ModelValidation
 {
     private static readonly Regex IdentifierRegex = CreateIdentifierRegex();
     private static readonly Regex Sha256Regex = CreateSha256Regex();
+    private static readonly HashSet<string> MediaSubtypes = new(StringComparer.Ordinal)
+    {
+        "panorama", "screenshot", "livePhoto", "depthEffect", "raw", "hdr",
+        "slowMotion", "highFrameRate", "timelapse", "cinematic", "screenRecording", "spatialMedia",
+    };
+    private static readonly HashSet<string> PhotoKitResourceTypes = new(StringComparer.Ordinal)
+    {
+        "photo", "video", "audio", "alternatePhoto", "fullSizePhoto", "fullSizeVideo",
+        "adjustmentData", "adjustmentBasePhoto", "pairedVideo", "fullSizePairedVideo",
+        "adjustmentBasePairedVideo", "adjustmentBaseVideo", "unknown",
+    };
 
     public static void Validate(ExportJob job)
     {
@@ -18,7 +29,7 @@ public static partial class ModelValidation
 
         if (job.ProtocolVersion != ProtocolConstants.Version)
         {
-            throw new ReceiverApiException(426, ErrorCodes.ProtocolMismatch, "Only protocol version 1 is supported.");
+            throw new ReceiverApiException(426, ErrorCodes.ProtocolMismatch, "Only protocol version 2 is supported. Create a fresh portable library and replan the transfer.");
         }
 
         RequireGuid(job.JobId, "jobId");
@@ -27,9 +38,9 @@ public static partial class ModelValidation
             Invalid("createdAt is required.");
         }
 
-        if (string.IsNullOrWhiteSpace(job.SourceTimeZone) || job.SourceTimeZone.Length > 128)
+        if (string.IsNullOrWhiteSpace(job.SourceTimeZone) || job.SourceTimeZone.Length > 64)
         {
-            Invalid("sourceTimeZone is required and must be at most 128 characters.");
+            Invalid("sourceTimeZone is required and must be at most 64 characters.");
         }
 
         if (job.Assets.Count is 0 or > 100_000)
@@ -37,19 +48,9 @@ public static partial class ModelValidation
             Invalid("A job must contain between 1 and 100,000 assets.");
         }
 
-        if (!Enum.IsDefined(typeof(ExportProfileKind), job.Profile.Kind) || job.Profile.ProfileVersion != 1)
+        if (job.Profile.Kind != ExportProfileKind.PortableLibrary || job.Profile.ProfileVersion != 2)
         {
-            Invalid("The export profile kind and profileVersion must be supported by protocol v1.");
-        }
-
-        if (job.Profile.Kind == ExportProfileKind.OriginalsAndCurrentJpegs &&
-            string.IsNullOrWhiteSpace(job.Profile.JpegRendererVersion))
-        {
-            Invalid("jpegRendererVersion is required for the originalsAndCurrentJpegs profile.");
-        }
-        if (job.Profile.Kind == ExportProfileKind.PreserveOriginals && job.Profile.JpegRendererVersion is not null)
-        {
-            Invalid("jpegRendererVersion must be omitted for the preserveOriginals profile.");
+            Invalid("Only the portableLibrary profileVersion 2 profile is supported.");
         }
 
         if (!Enum.IsDefined(typeof(SelectionKind), job.Selection.Kind) ||
@@ -101,6 +102,11 @@ public static partial class ModelValidation
             {
                 Invalid("Asset and recovery fingerprint mediaType must be photo or video.");
             }
+            if (asset.MediaSubtypes.Distinct(StringComparer.Ordinal).Count() != asset.MediaSubtypes.Count ||
+                asset.MediaSubtypes.Any(subtype => !MediaSubtypes.Contains(subtype)))
+            {
+                Invalid("mediaSubtypes contains a duplicate or unsupported value.");
+            }
             if (asset.Files.Count == 0 ||
                 asset.RecoveryFingerprint.OriginalFilenames is null ||
                 asset.RecoveryFingerprint.ResourceByteCounts is null ||
@@ -112,10 +118,6 @@ public static partial class ModelValidation
             {
                 Invalid("The asset files and recovery fingerprint are incomplete.");
             }
-            if (!job.Profile.PreserveLocation && asset.Location is not null)
-            {
-                Invalid("Asset location must be omitted when preserveLocation is false.");
-            }
             if (asset.Location is { } location &&
                 (double.IsNaN(location.Latitude) || double.IsInfinity(location.Latitude) ||
                  double.IsNaN(location.Longitude) || double.IsInfinity(location.Longitude) ||
@@ -125,12 +127,51 @@ public static partial class ModelValidation
                 Invalid("Asset location coordinates are outside their valid ranges.");
             }
 
+            var assetFileIds = asset.Files.Select(static file => file.FileId).ToHashSet();
+            var masterFiles = asset.Files.Where(static file =>
+                file.StorageArea == StorageArea.Master || file.Roles.Contains(RepresentationRole.MasterCurrent)).ToArray();
+            if (masterFiles.Length > 1)
+            {
+                Invalid("Each asset may contain at most one Master representation.");
+            }
+            if (asset.MasterFileId is { } masterFileId &&
+                (masterFileId == Guid.Empty || masterFiles.Length != 1 || masterFiles[0].FileId != masterFileId ||
+                 masterFiles[0].Availability != Availability.Available))
+            {
+                Invalid("masterFileId must reference the asset's single available Master representation.");
+            }
+            if (asset.MasterFileId is null && masterFiles.Length != 0)
+            {
+                if (masterFiles.Length != 1 || masterFiles[0].Availability == Availability.Available)
+                {
+                    Invalid("An available Master representation must declare masterFileId.");
+                }
+            }
+
+            var isLivePhoto = asset.MediaSubtypes.Contains("livePhoto", StringComparer.Ordinal);
+            if (isLivePhoto != (asset.LivePhotoRelationships is not null))
+            {
+                Invalid("mediaSubtypes must contain livePhoto exactly when livePhotoRelationships is present.");
+            }
+            ValidateLivePhotoRelationships(asset.LivePhotoRelationships, assetFileIds, asset.Files);
+            if (asset.MasterFileId is { } activeMaster &&
+                asset.LivePhotoRelationships is { } relationships &&
+                relationships.CurrentStillFileId != activeMaster)
+            {
+                Invalid("A Live Photo's currentStillFileId must equal its active masterFileId.");
+            }
+
             foreach (var file in asset.Files)
             {
-                if (!Enum.IsDefined(typeof(ExportFileKind), file.Kind) ||
-                    !Enum.IsDefined(typeof(ResourceType), file.ResourceType))
+                if (!Enum.IsDefined(typeof(StorageArea), file.StorageArea) ||
+                    !Enum.IsDefined(typeof(Criticality), file.Criticality) ||
+                    !Enum.IsDefined(typeof(Provenance), file.Provenance) ||
+                    !Enum.IsDefined(typeof(Availability), file.Availability) ||
+                    file.Roles is null || file.Roles.Count == 0 ||
+                    file.Roles.Any(static role => !Enum.IsDefined(typeof(RepresentationRole), role)) ||
+                    file.Roles.Distinct().Count() != file.Roles.Count)
                 {
-                    Invalid("The export file kind or resourceType is unsupported.");
+                    Invalid("The export file storage area, roles, criticality, provenance, or availability is unsupported.");
                 }
                 RequireGuid(file.FileId, "fileId");
                 if (!fileIds.Add(file.FileId))
@@ -142,10 +183,20 @@ public static partial class ModelValidation
                 {
                     Invalid("originalFilename is required.");
                 }
+                if (string.IsNullOrWhiteSpace(file.ProposedRelativePath) ||
+                    file.ProposedRelativePath.Length > ProtocolConstants.MaximumRelativePathLength)
+                {
+                    Invalid("proposedRelativePath is required and must be at most 239 UTF-16 code units.");
+                }
 
                 if (file.ByteCount is < 0)
                 {
                     Invalid("byteCount cannot be negative.");
+                }
+
+                if (file.PixelWidth is < 0 || file.PixelHeight is < 0 || file.DurationMilliseconds is < 0)
+                {
+                    Invalid("File dimensions and duration cannot be negative.");
                 }
 
                 if (file.AssetId != asset.AssetId)
@@ -153,14 +204,58 @@ public static partial class ModelValidation
                     Invalid("ExportFile.assetId must match its containing asset.");
                 }
 
-                RequireSha256(file.SourceRevision, "sourceRevision");
-                if (!string.Equals(file.SourceRevision, asset.SourceRevision, StringComparison.Ordinal))
+                RequireSha256(file.ContentRevision, "contentRevision");
+                if (file.Provenance == Provenance.ExactPhotoKitResource &&
+                    (file.PhotoKitResourceType is null || !PhotoKitResourceTypes.Contains(file.PhotoKitResourceType) ||
+                     file.PhotoKitResourceTypeRaw is null or < 0))
                 {
-                    Invalid("ExportFile.sourceRevision must match its containing asset.");
+                    Invalid("An exact PhotoKit resource requires a supported photoKitResourceType and nonnegative raw code.");
                 }
                 if (file.Sha256 is not null)
                 {
                     RequireSha256(file.Sha256, "sha256");
+                }
+                if (file.Availability != Availability.Available && file.Sha256 is not null)
+                {
+                    Invalid("An unavailable representation cannot claim a verified sha256 digest.");
+                }
+
+                if (file.StorageArea == StorageArea.Master)
+                {
+                    if (!file.Roles.Contains(RepresentationRole.MasterCurrent) ||
+                        file.Roles.Any(static role => role is not (RepresentationRole.MasterCurrent or RepresentationRole.RootOriginal)) ||
+                        file.Criticality != Criticality.MasterRequired ||
+                        file.Provenance != Provenance.ExactPhotoKitResource)
+                    {
+                        Invalid("A Master file must be a masterRequired exact PhotoKit masterCurrent representation.");
+                    }
+                }
+                else if (file.Roles.Contains(RepresentationRole.MasterCurrent))
+                {
+                    Invalid("masterCurrent files must use the Master storage area.");
+                }
+                if (file.Roles.Any(static role => role is RepresentationRole.CurrentLiveMotion or RepresentationRole.OriginalLiveMotion) &&
+                    file.StorageArea != StorageArea.LibraryData)
+                {
+                    Invalid("Live Photo motion representations must use Library Data.");
+                }
+                if (file.Criticality == Criticality.MasterRequired &&
+                    !file.Roles.Contains(RepresentationRole.MasterCurrent))
+                {
+                    Invalid("masterRequired files must carry the masterCurrent role.");
+                }
+
+                if (file.Provenance == Provenance.GeneratedThumbnail &&
+                    (file.StorageArea != StorageArea.LibraryData ||
+                     file.Criticality != Criticality.Optional ||
+                     file.Roles.Count != 1 || file.Roles[0] != RepresentationRole.Auxiliary ||
+                     file.PhotoKitResourceType is not null || file.PhotoKitResourceTypeRaw is not null ||
+                     !string.Equals(
+                         file.ProposedRelativePath,
+                         $"MB Photos Data/Thumbnails/{asset.AssetId:D}/{file.FileId:D}.jpg",
+                         StringComparison.Ordinal)))
+                {
+                    Invalid("Generated thumbnails must be canonical optional Library Data auxiliary JPEGs without PhotoKit resource types.");
                 }
             }
         }
@@ -178,6 +273,46 @@ public static partial class ModelValidation
             {
                 Invalid($"Album membership references unknown asset '{membership.AssetId}'.");
             }
+        }
+    }
+
+    private static void ValidateLivePhotoRelationships(
+        LivePhotoRelationships? relationships,
+        IReadOnlySet<Guid> fileIds,
+        IReadOnlyList<ExportFile> files)
+    {
+        if (relationships is null)
+        {
+            return;
+        }
+
+        var byId = files.ToDictionary(static file => file.FileId);
+        foreach (var (id, role, name) in new[]
+                 {
+                     (relationships.CurrentStillFileId, (RepresentationRole?)null, "currentStillFileId"),
+                     (relationships.CurrentMotionFileId, RepresentationRole.CurrentLiveMotion, "currentMotionFileId"),
+                     (relationships.OriginalStillFileId, RepresentationRole.RootOriginal, "originalStillFileId"),
+                     (relationships.OriginalMotionFileId, RepresentationRole.OriginalLiveMotion, "originalMotionFileId"),
+                 })
+        {
+            if (id is null)
+            {
+                continue;
+            }
+            if (id == Guid.Empty || !fileIds.Contains(id.Value))
+            {
+                Invalid($"{name} must reference a file in the same asset.");
+            }
+            if (role is { } requiredRole && !byId[id.Value].Roles.Contains(requiredRole))
+            {
+                Invalid($"{name} must reference a file with the {requiredRole} role.");
+            }
+        }
+
+        if (relationships.CurrentStillFileId is { } currentStill &&
+            !byId[currentStill].Roles.Contains(RepresentationRole.MasterCurrent))
+        {
+            Invalid("currentStillFileId must reference the Master still representation.");
         }
     }
 

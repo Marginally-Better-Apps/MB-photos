@@ -14,6 +14,7 @@ public sealed class ManifestWriter
     private readonly Ledger ledger;
     private readonly WindowsPathPolicy pathPolicy;
     private readonly JsonSerializerOptions jsonOptions;
+    private readonly SemaphoreSlim writeGate = new(1, 1);
 
     public ManifestWriter(
         DestinationContext destination,
@@ -30,6 +31,9 @@ public sealed class ManifestWriter
 
     public async Task WriteAsync(CompletionReport report, CancellationToken cancellationToken = default)
     {
+        await writeGate.WaitAsync(cancellationToken);
+        try
+        {
         var buildPath = Path.Combine(
             destination.ControlPath,
             BuildPrefix + Guid.NewGuid().ToString("N") + ".sqlite");
@@ -56,22 +60,34 @@ public sealed class ManifestWriter
                 cancellationToken: cancellationToken);
 
             await SafeWriteAsync(
-                Path.Combine(destination.RootPath, "Metadata", "assets.jsonl"),
+                pathPolicy.ResolveUnderRoot(destination.RootPath, report.CatalogGeneration.AssetsRelativePath),
                 index.WriteAssetsAsync,
                 cancellationToken);
             await SafeWriteAsync(
-                Path.Combine(destination.RootPath, "Metadata", "albums.csv"),
-                index.WriteAlbumsCsvAsync,
-                cancellationToken);
-            await SafeWriteAsync(
-                Path.Combine(destination.RootPath, "Metadata", "albums.jsonl"),
+                pathPolicy.ResolveUnderRoot(destination.RootPath, report.CatalogGeneration.AlbumsRelativePath),
                 index.WriteAlbumsJsonAsync,
                 cancellationToken);
             await SafeWriteAsync(
-                Path.Combine(destination.RootPath, "Reports", report.JobId.ToString("D") + ".json"),
+                pathPolicy.ResolveUnderRoot(destination.RootPath, report.ReportRelativePath),
                 (stream, token) => JsonSerializer.SerializeAsync(
                     stream,
                     report,
+                    new JsonSerializerOptions(jsonOptions) { WriteIndented = true },
+                    token),
+                cancellationToken);
+            var pointer = new CatalogPointer(
+                2,
+                report.CatalogGeneration.GenerationId,
+                report.CompletedAt,
+                report.CatalogGeneration.AssetsRelativePath,
+                report.CatalogGeneration.AlbumsRelativePath);
+            await SafeWriteAsync(
+                pathPolicy.ResolveUnderRoot(
+                    destination.RootPath,
+                    report.CatalogGeneration.CatalogPointerRelativePath),
+                (stream, token) => JsonSerializer.SerializeAsync(
+                    stream,
+                    pointer,
                     new JsonSerializerOptions(jsonOptions) { WriteIndented = true },
                     token),
                 cancellationToken);
@@ -80,11 +96,48 @@ public sealed class ManifestWriter
         {
             DeleteBuildFiles(buildPath);
         }
+        }
+        finally
+        {
+            writeGate.Release();
+        }
+    }
+
+    public async Task EnsurePublishedAsync(
+        CompletionReport report,
+        CancellationToken cancellationToken = default)
+    {
+        var pointerPath = pathPolicy.ResolveUnderRoot(
+            destination.RootPath,
+            report.CatalogGeneration.CatalogPointerRelativePath);
+        if (File.Exists(pointerPath))
+        {
+            try
+            {
+                await using var stream = File.OpenRead(pointerPath);
+                var pointer = await JsonSerializer.DeserializeAsync<CatalogPointer>(
+                    stream,
+                    jsonOptions,
+                    cancellationToken);
+                if (pointer?.GenerationId == report.CatalogGeneration.GenerationId &&
+                    File.Exists(pathPolicy.ResolveUnderRoot(destination.RootPath, pointer.AssetsRelativePath)) &&
+                    File.Exists(pathPolicy.ResolveUnderRoot(destination.RootPath, pointer.AlbumsRelativePath)) &&
+                    File.Exists(pathPolicy.ResolveUnderRoot(destination.RootPath, report.ReportRelativePath)))
+                {
+                    return;
+                }
+            }
+            catch (JsonException)
+            {
+                // Rebuild the immutable generation and pointer from the ledger.
+            }
+        }
+        await WriteAsync(report, cancellationToken);
     }
 
     public async Task<CompletionReport?> ReadReportAsync(Guid jobId, CancellationToken cancellationToken = default)
     {
-        var path = Path.Combine(destination.RootPath, "Reports", jobId.ToString("D") + ".json");
+        var path = Path.Combine(destination.ReportsPath, jobId.ToString("D") + ".json");
         pathPolicy.EnsureNoReparsePoints(destination.RootPath, path);
         if (!File.Exists(path))
         {
@@ -188,6 +241,7 @@ public sealed class ManifestWriter
                         ordinal INTEGER PRIMARY KEY,
                         file_id TEXT NOT NULL UNIQUE,
                         relative_path TEXT NOT NULL,
+                        state TEXT NOT NULL,
                         committed_sha256 TEXT NULL,
                         committed_bytes INTEGER NULL
                     );
@@ -228,12 +282,13 @@ public sealed class ManifestWriter
             insertReceivedFile = connection.CreateCommand();
             insertReceivedFile.CommandText = """
                 INSERT INTO received_files(
-                    ordinal,file_id,relative_path,committed_sha256,committed_bytes)
-                VALUES($ordinal,$file,$path,$sha,$bytes)
+                    ordinal,file_id,relative_path,state,committed_sha256,committed_bytes)
+                VALUES($ordinal,$file,$path,$state,$sha,$bytes)
                 """;
             insertReceivedFile.Parameters.Add("$ordinal", SqliteType.Integer);
             insertReceivedFile.Parameters.Add("$file", SqliteType.Text);
             insertReceivedFile.Parameters.Add("$path", SqliteType.Text);
+            insertReceivedFile.Parameters.Add("$state", SqliteType.Text);
             insertReceivedFile.Parameters.Add("$sha", SqliteType.Text);
             insertReceivedFile.Parameters.Add("$bytes", SqliteType.Integer);
         }
@@ -263,6 +318,7 @@ public sealed class ManifestWriter
                     insertReceivedFile.Parameters["$ordinal"].Value = receivedFileCount;
                     insertReceivedFile.Parameters["$file"].Value = file.FileId.ToString("D");
                     insertReceivedFile.Parameters["$path"].Value = file.RelativePath;
+                    insertReceivedFile.Parameters["$state"].Value = file.State;
                     insertReceivedFile.Parameters["$sha"].Value = file.CommittedSha256 is null ? DBNull.Value : file.CommittedSha256;
                     insertReceivedFile.Parameters["$bytes"].Value = file.CommittedBytes is null ? DBNull.Value : file.CommittedBytes.Value;
                     insertReceivedFile.ExecuteNonQuery();
@@ -300,7 +356,8 @@ public sealed class ManifestWriter
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         var asset = job.Assets[assetOffset + index];
-                        var exportedFiles = new ExportFile[asset.Files.Count];
+                        var catalogFiles = new CatalogFile[asset.Files.Count];
+                        var receivedForAsset = new ReceivedFile[asset.Files.Count];
                         for (var fileIndex = 0; fileIndex < asset.Files.Count; fileIndex++)
                         {
                             var file = asset.Files[fileIndex];
@@ -310,20 +367,70 @@ public sealed class ManifestWriter
                             }
 
                             var received = receivedFiles[receivedIndex++];
-                            exportedFiles[fileIndex] = file with
-                            {
-                                ProposedRelativePath = received.RelativePath,
-                                ByteCount = received.CommittedBytes,
-                                Sha256 = received.CommittedSha256,
-                            };
+                            receivedForAsset[fileIndex] = received;
+                            var isAvailable = received.State is "committed" or "skipped";
+                            var availability = isAvailable
+                                ? Availability.Available
+                                : file.Availability == Availability.Available
+                                    ? Availability.TransferFailed
+                                    : file.Availability;
+                            catalogFiles[fileIndex] = new CatalogFile(
+                                file.FileId,
+                                file.ContentRevision,
+                                file.StorageArea,
+                                file.Roles,
+                                file.Criticality,
+                                file.Provenance,
+                                file.PhotoKitResourceType,
+                                file.PhotoKitResourceTypeRaw,
+                                file.OriginalFilename,
+                                file.UniformTypeIdentifier,
+                                file.ContentType,
+                                file.PixelWidth,
+                                file.PixelHeight,
+                                file.DurationMilliseconds,
+                                isAvailable ? received.CommittedBytes : file.ByteCount,
+                                isAvailable ? received.CommittedSha256 : null,
+                                file.CaptureDate,
+                                isAvailable ? received.RelativePath : null,
+                                availability);
                         }
 
-                        var exportedAsset = asset with { Files = exportedFiles };
+                        var masterAvailable = asset.MasterFileId is { } masterId &&
+                            receivedForAsset.Any(received =>
+                                received.FileId == masterId && received.State is "committed" or "skipped");
+                        if (!masterAvailable && AssetExists(asset.AssetId, transaction))
+                        {
+                            // A failed required current representation never
+                            // replaces the last usable catalog generation for an
+                            // already-known asset.
+                            continue;
+                        }
+                        var archiveState = asset.Files.Select((file, fileIndex) => (file, receivedForAsset[fileIndex]))
+                            .Any(pair => pair.file.Criticality == Criticality.ArchiveRequired &&
+                                         pair.Item2.State is not ("committed" or "skipped"))
+                            ? ArchiveState.Incomplete
+                            : ArchiveState.Complete;
+                        var catalogAsset = new CatalogAsset(
+                            2,
+                            asset.AssetId,
+                            asset.SourceLocalIdentifier,
+                            asset.SourceRevision,
+                            asset.MediaType,
+                            asset.MediaSubtypes,
+                            asset.CreationDate,
+                            asset.ModificationDate,
+                            asset.Location,
+                            asset.IsEdited,
+                            masterAvailable ? asset.MasterFileId : null,
+                            asset.LivePhotoRelationships,
+                            archiveState,
+                            catalogFiles);
                         upsertAsset.Parameters["$asset"].Value = asset.AssetId.ToString("D");
                         upsertAsset.Parameters["$created"].Value = asset.CreationDate is null
                             ? DBNull.Value
                             : asset.CreationDate.Value.ToUniversalTime().ToString("O");
-                        upsertAsset.Parameters["$json"].Value = JsonSerializer.Serialize(exportedAsset, jsonOptions);
+                        upsertAsset.Parameters["$json"].Value = JsonSerializer.Serialize(catalogAsset, jsonOptions);
                         upsertAsset.ExecuteNonQuery();
                     }
                     transaction.Commit();
@@ -361,7 +468,15 @@ public sealed class ManifestWriter
                         upsertMembership.Parameters["$parent"].Value = membership.ParentAlbumId is null
                             ? DBNull.Value
                             : membership.ParentAlbumId.Value.ToString("D");
-                        upsertMembership.Parameters["$json"].Value = JsonSerializer.Serialize(membership, jsonOptions);
+                        upsertMembership.Parameters["$json"].Value = JsonSerializer.Serialize(
+                            new CatalogAlbumMembership(
+                                2,
+                                membership.AlbumId,
+                                membership.SourceAlbumIdentifier,
+                                membership.AlbumTitle,
+                                membership.ParentAlbumId,
+                                membership.AssetId),
+                            jsonOptions);
                         upsertMembership.ExecuteNonQuery();
                     }
                     transaction.Commit();
@@ -371,6 +486,15 @@ public sealed class ManifestWriter
                     upsertMembership.Transaction = null;
                 }
             }
+        }
+
+        private bool AssetExists(Guid assetId, SqliteTransaction transaction)
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT EXISTS(SELECT 1 FROM assets WHERE asset_id=$asset)";
+            command.Parameters.AddWithValue("$asset", assetId.ToString("D"));
+            return Convert.ToInt32(command.ExecuteScalar()) == 1;
         }
 
         private IReadOnlyList<ReceivedFile> ReadReceivedFiles(
@@ -386,7 +510,7 @@ public sealed class ManifestWriter
 
             using var command = connection.CreateCommand();
             command.CommandText = """
-                SELECT file_id,relative_path,committed_sha256,committed_bytes
+                SELECT file_id,relative_path,state,committed_sha256,committed_bytes
                 FROM received_files
                 WHERE ordinal >= $start AND ordinal < $end
                 ORDER BY ordinal
@@ -400,8 +524,9 @@ public sealed class ManifestWriter
                 results.Add(new ReceivedFile(
                     Guid.Parse(reader.GetString(0)),
                     reader.GetString(1),
-                    reader.IsDBNull(2) ? null : reader.GetString(2),
-                    reader.IsDBNull(3) ? null : reader.GetInt64(3)));
+                    reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetInt64(4)));
             }
             return results;
         }
@@ -471,6 +596,7 @@ public sealed class ManifestWriter
         private sealed record ReceivedFile(
             Guid FileId,
             string RelativePath,
+            string State,
             string? CommittedSha256,
             long? CommittedBytes);
     }

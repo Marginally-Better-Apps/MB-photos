@@ -1,0 +1,27 @@
+{
+  "protocolVersion": 2,
+  "jobId": "11111111-1111-4111-8111-111111111111",
+  "destinationId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  "state": "completed",
+  "startedAt": "2026-08-31T15:03:00Z",
+  "completedAt": "2026-08-31T15:17:53Z",
+  "counts": {
+    "assetsPlanned": 2,
+    "assetsPromoted": 2,
+    "assetsArchiveIncomplete": 0,
+    "filesPlanned": 5,
+    "filesCommitted": 4,
+    "filesSkipped": 1,
+    "filesFailed": 0,
+    "bytesTransferred": 70000000,
+    "bytesCommitted": 74839211
+  },
+  "failures": [],
+  "reportRelativePath": "MB Photos Data/Reports/11111111-1111-4111-8111-111111111111.json",
+  "catalogGeneration": {
+    "generationId": "12345678-1234-4234-8234-123456789abc",
+    "catalogPointerRelativePath": "MB Photos Data/Catalog/current.json",
+    "assetsRelativePath": "MB Photos Data/Catalog/generations/12345678-1234-4234-8234-123456789abc/assets.jsonl",
+    "albumsRelativePath": "MB Photos Data/Catalog/generations/12345678-1234-4234-8234-123456789abc/albums.jsonl"
+  }
+}

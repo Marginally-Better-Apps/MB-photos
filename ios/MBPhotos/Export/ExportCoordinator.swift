@@ -5,8 +5,8 @@ import UIKit
 enum ExportPhase: String, Sendable {
     case idle
     case planning
-    case preparingOriginal = "Downloading original"
-    case renderingJPEG = "Creating Windows JPEG"
+    case preparingResource = "Downloading PhotoKit resource"
+    case renderingThumbnail = "Creating library thumbnail"
     case transferring = "Transferring"
     case verifying = "Verifying"
     case paused = "Paused"
@@ -243,8 +243,8 @@ private actor ExportWorker {
     }
 
     private let ledger: SQLiteLedger
-    private let originalProvider: any OriginalRenditionProviding
-    private let jpegRenderer: any CurrentJPEGRendering
+    private let resourceProvider: any PhotoResourceMaterializing
+    private let thumbnailRenderer: any ThumbnailRendering
     private let staging: StagedRenditionStore
     private var client: TransferClient?
     private var activeTask: Task<Void, Never>?
@@ -264,8 +264,8 @@ private actor ExportWorker {
 
     init(
         ledger: SQLiteLedger,
-        originalProvider: any OriginalRenditionProviding = PhotoKitRenditionProvider(),
-        jpegRenderer: any CurrentJPEGRendering = PhotoKitJPEGRenderer(),
+        resourceProvider: any PhotoResourceMaterializing = PhotoKitRenditionProvider(),
+        thumbnailRenderer: any ThumbnailRendering = PhotoKitThumbnailRenderer(),
         staging: StagedRenditionStore
     ) {
         var continuation: AsyncStream<ExportEvent>.Continuation!
@@ -274,8 +274,8 @@ private actor ExportWorker {
         }
         self.eventContinuation = continuation
         self.ledger = ledger
-        self.originalProvider = originalProvider
-        self.jpegRenderer = jpegRenderer
+        self.resourceProvider = resourceProvider
+        self.thumbnailRenderer = thumbnailRenderer
         self.staging = staging
     }
 
@@ -450,6 +450,15 @@ private actor ExportWorker {
         publish(immediate: true)
     }
 
+    func dismissCompletion() {
+        guard !isRunning,
+              progress.phase == .completed || progress.phase == .completedWithFailures else { return }
+        currentPlan = nil
+        completionReport = nil
+        progress = ExportProgressState()
+        publish(immediate: true)
+    }
+
     private func run(_ plan: PlannedExport, generation execution: UInt64) async {
         guard let client else {
             finishRun(phase: .failed, message: "Scan the current receiver QR code first.")
@@ -513,10 +522,23 @@ private actor ExportWorker {
                     successfulFileIDs.insert(file.fileId)
                     progress.skippedFileCount += 1
                 case .conflict:
+                    let code: APIErrorCode
+                    let message: String
+                    switch decision.reason {
+                    case .masterConflict:
+                        code = .masterConflict
+                        message = "The existing Master file was changed outside MB Photos and was left untouched."
+                    case .sourceUnavailable:
+                        code = .unavailableSource
+                        message = "The selected Photos resource is no longer available."
+                    default:
+                        code = .pathConflict
+                        message = "The receiver could not allocate a safe destination path."
+                    }
                     let failure = CompletionFailure(
                         fileId: file.fileId,
-                        code: .pathConflict,
-                        message: "The receiver could not allocate a safe destination path.",
+                        code: code,
+                        message: message,
                         retryable: false
                     )
                     try await ledger.recordFile(
@@ -643,25 +665,24 @@ private actor ExportWorker {
         guard let sourceAssetID = plan.sourceAssetIDsByFileID[file.fileId] else {
             throw RenditionError.assetUnavailable(file.assetId.uuidString)
         }
-        switch file.kind {
-        case .originalResource:
+        switch file.provenance {
+        case .exactPhotoKitResource:
             guard let descriptor = plan.sourceResourcesByFileID[file.fileId] else {
                 throw RenditionError.resourceUnavailable(file.originalFilename)
             }
-            progress.phase = .preparingOriginal
-            try await originalProvider.materializeOriginal(
+            progress.phase = .preparingResource
+            try await resourceProvider.materializeResource(
                 assetID: sourceAssetID,
                 descriptor: descriptor,
                 to: preparation.workingURL
             ) { [weak self] fraction in
                 Task { await self?.recordPreparationProgress(fraction, generation: generation) }
             }
-        case .currentJpeg:
-            progress.phase = .renderingJPEG
-            try await jpegRenderer.renderCurrentJPEG(
+        case .generatedThumbnail:
+            progress.phase = .renderingThumbnail
+            try await thumbnailRenderer.renderThumbnail(
                 assetID: sourceAssetID,
-                to: preparation.workingURL,
-                preserveLocation: plan.job.profile.preserveLocation
+                to: preparation.workingURL
             ) { [weak self] fraction in
                 Task { await self?.recordPreparationProgress(fraction, generation: generation) }
             }
@@ -694,16 +715,17 @@ private actor ExportWorker {
 
         for (offset, asset) in job.assets.enumerated() {
             if offset.isMultiple(of: 64) { try checkExecution(generation) }
-            var hasOriginal = false
-            var allOriginalsSucceeded = true
-            for file in asset.files where file.kind == .originalResource {
-                hasOriginal = true
+            var hasRequiredArchive = false
+            var allRequiredResourcesSucceeded = true
+            for file in asset.files where file.provenance == .exactPhotoKitResource
+                && file.criticality != .optional {
+                hasRequiredArchive = true
                 if !successfulFileIDs.contains(file.fileId) {
-                    allOriginalsSucceeded = false
+                    allRequiredResourcesSucceeded = false
                     break
                 }
             }
-            guard hasOriginal, allOriginalsSucceeded else { continue }
+            guard hasRequiredArchive, allRequiredResourcesSucceeded else { continue }
             batch.append(
                 VerifiedAssetExportRecord(
                     sourceLocalIdentifier: asset.sourceLocalIdentifier,
@@ -736,11 +758,15 @@ private actor ExportWorker {
 
     private func validateDecisions(_ decisions: [FileDecision], files: [ExportFile]) throws {
         let expected = Set(files.map(\.fileId))
+        let filesByID = Dictionary(uniqueKeysWithValues: files.map { ($0.fileId, $0) })
         let actual = decisions.map(\.fileId)
         guard Set(actual) == expected, Set(actual).count == actual.count else {
             throw TransferError.invalidResponse
         }
         for decision in decisions {
+            guard let file = filesByID[decision.fileId] else {
+                throw TransferError.invalidResponse
+            }
             guard decision.nextChunkIndex >= 0 else { throw TransferError.invalidResponse }
             if decision.nextChunkIndex == 0 {
                 guard decision.acknowledgedChunks.isEmpty else { throw TransferError.invalidResponse }
@@ -767,6 +793,16 @@ private actor ExportWorker {
                 guard decision.acceptedRelativePath != nil else { throw TransferError.invalidResponse }
             case .conflict:
                 break
+            }
+            if file.availability == .sourceUnavailable {
+                guard decision.action == .conflict,
+                      decision.reason == .sourceUnavailable else {
+                    throw TransferError.invalidResponse
+                }
+            }
+            if decision.reason == .masterConflict,
+               decision.action != .conflict {
+                throw TransferError.invalidResponse
             }
         }
     }
@@ -795,7 +831,7 @@ private actor ExportWorker {
                 return CompletionFailure(
                     fileId: fileID,
                     code: .unavailableSource,
-                    message: "The current still rendition could not be generated.",
+                    message: "The library thumbnail could not be generated.",
                     retryable: false
                 )
             case .cancelled:
@@ -808,7 +844,8 @@ private actor ExportWorker {
         else { return nil }
         switch code {
         case .fileConflict, .chunkConflict, .pathConflict, .hashMismatch,
-             .unavailableSource, .changedDestination:
+             .unavailableSource, .masterConflict, .archiveIncomplete,
+             .changedDestination:
             return CompletionFailure(
                 fileId: fileID,
                 code: code,
@@ -952,14 +989,14 @@ final class ExportCoordinator: ObservableObject {
 
     init(
         ledger: SQLiteLedger,
-        originalProvider: any OriginalRenditionProviding = PhotoKitRenditionProvider(),
-        jpegRenderer: any CurrentJPEGRendering = PhotoKitJPEGRenderer(),
+        resourceProvider: any PhotoResourceMaterializing = PhotoKitRenditionProvider(),
+        thumbnailRenderer: any ThumbnailRendering = PhotoKitThumbnailRenderer(),
         staging: StagedRenditionStore
     ) {
         let worker = ExportWorker(
             ledger: ledger,
-            originalProvider: originalProvider,
-            jpegRenderer: jpegRenderer,
+            resourceProvider: resourceProvider,
+            thumbnailRenderer: thumbnailRenderer,
             staging: staging
         )
         self.worker = worker
@@ -1056,6 +1093,17 @@ final class ExportCoordinator: ObservableObject {
         guard generation == startupGeneration,
               currentPlan?.job.jobId == jobID else { return }
         await worker.discardCurrentJob(expectedJobID: jobID)
+    }
+
+    func dismissCompletion() {
+        guard !isRunning,
+              progress.phase == .completed || progress.phase == .completedWithFailures else { return }
+        replaceCurrentPlan(with: nil)
+        replaceCompletionReport(with: nil)
+        progress = ExportProgressState()
+        Task.detached(priority: .userInitiated) { [worker] in
+            await worker.dismissCompletion()
+        }
     }
 
     private func apply(_ event: consuming ExportEvent) {

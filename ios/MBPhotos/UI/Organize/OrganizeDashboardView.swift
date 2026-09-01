@@ -41,6 +41,7 @@ struct OrganizeView: View {
             .padding(.horizontal)
             .padding(.bottom, 28)
         }
+        .navigationTitle("Organize")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -834,7 +835,7 @@ private struct OrganizeLibraryBreakdownSection: View {
                             .font(.subheadline.weight(.semibold))
                             .accessibilityLabel("More Details")
                             .accessibilityValue(showsMoreDetails ? "Expanded" : "Collapsed")
-                            .accessibilityHint("Shows overlapping Live Photo, RAW, favorite, edited, and album categories")
+                            .accessibilityHint("Shows overlapping screenshot, Live Photo, RAW, favorite, edited, and album categories")
                     }
                 }
             }

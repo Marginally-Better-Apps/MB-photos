@@ -1,0 +1,24 @@
+{
+  "protocolVersion": 2,
+  "sessionToken": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  "receiverRunId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  "destination": {
+    "destinationId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    "displayName": "Portable Photo Library (D:)",
+    "createdAt": "2026-08-31T15:01:10Z",
+    "freeBytes": 812345678901,
+    "pathPolicyVersion": 2,
+    "destinationFormatVersion": 2
+  },
+  "capabilities": {
+    "chunkSizeBytes": 8388608,
+    "maxRelativePathUtf16Units": 239,
+    "pathPolicyVersion": 2,
+    "destinationFormatVersion": 2,
+    "catalogFormatVersion": 2,
+    "hashAlgorithm": "sha256",
+    "sequentialChunksRequired": true,
+    "supportedProfiles": ["portableLibrary"],
+    "supportedStorageAreas": ["master", "libraryData"]
+  }
+}

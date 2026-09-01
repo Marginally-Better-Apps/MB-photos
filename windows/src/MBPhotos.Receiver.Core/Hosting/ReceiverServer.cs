@@ -8,12 +8,15 @@ using MBPhotos.Receiver.Transfer;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http.Json;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Options;
 
 namespace MBPhotos.Receiver.Hosting;
 
 public sealed class ReceiverServer : IAsyncDisposable
 {
+    public const long MaximumJobManifestBytes = 1024L * 1024 * 1024;
+    private const long MaximumOrdinaryRequestBytes = 128L * 1024 * 1024;
     private readonly WebApplication application;
     private readonly PairingSessionManager pairing;
     private readonly EphemeralCertificate certificate;
@@ -119,6 +122,10 @@ public sealed class ReceiverServer : IAsyncDisposable
             throw;
         }
         var manifestWriter = new ManifestWriter(destination, ledger, pathPolicy, jsonOptions);
+        var masterPromotion = new MasterPromotionService(destination, ledger, pathPolicy, jsonOptions);
+        await masterPromotion.RecoverInterruptedAsync(cancellationToken);
+        var representationReuse = new RepresentationReuseService(destination, ledger, pathPolicy);
+        var supersededRepresentations = new SupersededRepresentationService(destination, ledger, pathPolicy);
         var coordinator = new JobCoordinator(
             destination,
             destinationManager,
@@ -126,6 +133,9 @@ public sealed class ReceiverServer : IAsyncDisposable
             pathPolicy,
             transfers,
             manifestWriter,
+            masterPromotion,
+            representationReuse,
+            supersededRepresentations,
             jsonOptions);
         var pairing = new PairingSessionManager();
         var run = pairing.StartRun();
@@ -156,7 +166,7 @@ public sealed class ReceiverServer : IAsyncDisposable
             options.AddServerHeader = false;
             // A frozen 100k-asset manifest can be much larger than one chunk.
             // Chunk endpoints still enforce the negotiated 8 MiB size in code.
-            options.Limits.MaxRequestBodySize = 128L * 1024 * 1024;
+            options.Limits.MaxRequestBodySize = MaximumOrdinaryRequestBytes;
             options.Listen(address, 0, listen => listen.UseHttps(certificate.Certificate));
         });
         builder.Services.Configure<JsonOptions>(options =>
@@ -322,8 +332,8 @@ public sealed class ReceiverServer : IAsyncDisposable
 
         app.Use(async (context, next) =>
         {
-            if (context.Request.Path.StartsWithSegments("/v1") &&
-                !context.Request.Path.Equals("/v1/pair") &&
+            if (context.Request.Path.StartsWithSegments("/v2") &&
+                !context.Request.Path.Equals("/v2/pair") &&
                 !pairing.Authorize(context.Request.Headers.Authorization.ToString()))
             {
                 context.Response.StatusCode = 401;
@@ -346,7 +356,7 @@ public sealed class ReceiverServer : IAsyncDisposable
             await next(context);
         });
 
-        app.MapPost("/v1/pair", async (HttpContext context) =>
+        app.MapPost("/v2/pair", async (HttpContext context) =>
         {
             context.Response.Headers.CacheControl = "no-store";
             var request = await ReadRequiredAsync<PairRequest>(context, jsonOptions);
@@ -362,22 +372,26 @@ public sealed class ReceiverServer : IAsyncDisposable
                         ProtocolConstants.ChunkSize,
                         ProtocolConstants.MaximumRelativePathLength,
                         WindowsPathPolicy.Version,
+                        2,
+                        2,
                         "sha256",
                         true,
-                        new[] { "preserveOriginals", "originalsAndCurrentJpegs" })),
+                        new[] { "portableLibrary" },
+                        new[] { StorageArea.Master, StorageArea.LibraryData })),
                 jsonOptions);
         });
 
-        app.MapPost("/v1/jobs", async (HttpContext context) =>
+        app.MapPost("/v2/jobs", async (HttpContext context) =>
         {
+            ConfigureJobManifestRequestLimit(context);
             var job = await ReadRequiredAsync<ExportJob>(context, jsonOptions);
             return Results.Json(await coordinator.CreateJobAsync(job, context.RequestAborted), jsonOptions);
         });
 
-        app.MapGet("/v1/jobs/{jobId:guid}", async (Guid jobId, HttpContext context) =>
+        app.MapGet("/v2/jobs/{jobId:guid}", async (Guid jobId, HttpContext context) =>
             Results.Json(await coordinator.GetStatusAsync(jobId, context.RequestAborted), jsonOptions));
 
-        app.MapPut("/v1/jobs/{jobId:guid}/files/{fileId:guid}/chunks/{chunkIndex:int}", async (
+        app.MapPut("/v2/jobs/{jobId:guid}/files/{fileId:guid}/chunks/{chunkIndex:int}", async (
             Guid jobId,
             Guid fileId,
             int chunkIndex,
@@ -398,7 +412,7 @@ public sealed class ReceiverServer : IAsyncDisposable
             return Results.Json(receipt, jsonOptions);
         });
 
-        app.MapPost("/v1/jobs/{jobId:guid}/files/{fileId:guid}/commit", async (
+        app.MapPost("/v2/jobs/{jobId:guid}/files/{fileId:guid}/commit", async (
             Guid jobId,
             Guid fileId,
             HttpContext context) =>
@@ -407,22 +421,32 @@ public sealed class ReceiverServer : IAsyncDisposable
             return Results.Json(await coordinator.CommitAsync(jobId, fileId, request, context.RequestAborted), jsonOptions);
         });
 
-        app.MapPost("/v1/jobs/{jobId:guid}/complete", async (Guid jobId, HttpContext context) =>
+        app.MapPost("/v2/jobs/{jobId:guid}/complete", async (Guid jobId, HttpContext context) =>
         {
             var request = await ReadRequiredAsync<CompleteJobRequest>(context, jsonOptions);
             return Results.Json(await coordinator.CompleteAsync(jobId, request, context.RequestAborted), jsonOptions);
         });
 
-        app.MapPost("/v1/jobs/{jobId:guid}/abandon", async (Guid jobId, HttpContext context) =>
+        app.MapPost("/v2/jobs/{jobId:guid}/abandon", async (Guid jobId, HttpContext context) =>
         {
-            AbandonJobRequest? request = null;
-            if (context.Request.ContentLength is > 0)
-            {
-                request = await context.Request.ReadFromJsonAsync<AbandonJobRequest>(jsonOptions, context.RequestAborted);
-            }
-
+            var request = await ReadRequiredAsync<AbandonJobRequest>(context, jsonOptions);
             return Results.Json(await coordinator.AbandonAsync(jobId, request, context.RequestAborted), jsonOptions);
         });
+    }
+
+    private static void ConfigureJobManifestRequestLimit(HttpContext context)
+    {
+        if (context.Request.ContentLength > MaximumJobManifestBytes)
+        {
+            throw new ReceiverApiException(413, ErrorCodes.InvalidRequest,
+                "The frozen job manifest exceeds the 1 GiB receiver limit.");
+        }
+
+        var feature = context.Features.Get<IHttpMaxRequestBodySizeFeature>();
+        if (feature is { IsReadOnly: false })
+        {
+            feature.MaxRequestBodySize = MaximumJobManifestBytes;
+        }
     }
 
     private static async Task<T> ReadRequiredAsync<T>(HttpContext context, JsonSerializerOptions jsonOptions)

@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using MBPhotos.Receiver.Models;
+using System.Text.Json;
 
 namespace MBPhotos.Receiver.Storage;
 
@@ -18,8 +19,12 @@ public sealed record LedgerFile(
     Guid JobId,
     Guid FileId,
     Guid AssetId,
-    string SourceRevision,
-    ExportFileKind Kind,
+    string ContentRevision,
+    StorageArea StorageArea,
+    IReadOnlyList<RepresentationRole> Roles,
+    Criticality Criticality,
+    Provenance Provenance,
+    Availability Availability,
     string ProposedPath,
     string RelativePath,
     string OriginalFilename,
@@ -59,6 +64,34 @@ public sealed record LedgerStats(
 public sealed record LedgerSkip(
     Guid FileId,
     LedgerFile Prior,
+    long ObservedWriteTicks,
+    bool ReuseAtAcceptedPath = false);
+
+public sealed record LedgerPendingReuse(
+    Guid JobId,
+    Guid FileId,
+    string SourceRelativePath,
+    StorageArea SourceStorageArea,
+    long ByteCount,
+    string Sha256,
+    long ObservedWriteTicks);
+
+public sealed record LedgerActiveMaster(
+    Guid AssetId,
+    Guid FileId,
+    string ContentRevision,
+    string RelativePath,
+    long ByteCount,
+    string Sha256,
+    long ObservedWriteTicks,
+    DateTimeOffset ActivatedAt);
+
+public sealed record LedgerSupersededMaster(
+    Guid AssetId,
+    Guid FileId,
+    string RelativePath,
+    long ByteCount,
+    string Sha256,
     long ObservedWriteTicks);
 
 public sealed record LedgerCompletedJobBatch(
@@ -94,7 +127,7 @@ public sealed class Ledger : IAsyncDisposable
         {
             await ExecuteAsync(connection, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;", cancellationToken);
             var version = Convert.ToInt32(await ScalarAsync(connection, "PRAGMA user_version;", cancellationToken));
-            if (version > 3)
+            if (version > 4)
             {
                 throw new InvalidDataException($"The receiver ledger schema {version} is newer than this app supports.");
             }
@@ -129,8 +162,12 @@ public sealed class Ledger : IAsyncDisposable
                         job_id TEXT NOT NULL,
                         file_id TEXT NOT NULL,
                         asset_id TEXT NOT NULL,
-                        source_revision TEXT NOT NULL,
-                        kind TEXT NOT NULL,
+                        content_revision TEXT NOT NULL,
+                        storage_area TEXT NOT NULL,
+                        roles_json TEXT NOT NULL,
+                        criticality TEXT NOT NULL,
+                        provenance TEXT NOT NULL,
+                        availability TEXT NOT NULL,
                         proposed_path TEXT NOT NULL COLLATE NOCASE,
                         relative_path TEXT NOT NULL COLLATE NOCASE,
                         original_filename TEXT NOT NULL,
@@ -150,7 +187,7 @@ public sealed class Ledger : IAsyncDisposable
                     );
 
                     CREATE INDEX ix_files_file_revision
-                        ON files(file_id, source_revision, committed_at DESC);
+                        ON files(file_id, content_revision, committed_at DESC);
                     CREATE INDEX ix_files_relative_path
                         ON files(relative_path);
 
@@ -177,7 +214,40 @@ public sealed class Ledger : IAsyncDisposable
                         FOREIGN KEY (job_id, file_id) REFERENCES files(job_id, file_id) ON DELETE CASCADE
                     );
 
-                    PRAGMA user_version=3;
+                    CREATE TABLE active_masters (
+                        asset_id TEXT PRIMARY KEY,
+                        file_id TEXT NOT NULL,
+                        content_revision TEXT NOT NULL,
+                        relative_path TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                        byte_count INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        observed_write_ticks INTEGER NOT NULL,
+                        activated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE superseded_masters (
+                        asset_id TEXT NOT NULL,
+                        file_id TEXT NOT NULL,
+                        relative_path TEXT NOT NULL COLLATE NOCASE,
+                        byte_count INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        observed_write_ticks INTEGER NOT NULL,
+                        PRIMARY KEY(asset_id,file_id,relative_path)
+                    );
+
+                    CREATE TABLE pending_reuses (
+                        job_id TEXT NOT NULL,
+                        file_id TEXT NOT NULL,
+                        source_relative_path TEXT NOT NULL COLLATE NOCASE,
+                        source_storage_area TEXT NOT NULL,
+                        byte_count INTEGER NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        observed_write_ticks INTEGER NOT NULL,
+                        PRIMARY KEY(job_id,file_id),
+                        FOREIGN KEY(job_id,file_id) REFERENCES files(job_id,file_id) ON DELETE CASCADE
+                    );
+
+                    PRAGMA user_version=4;
                     """;
                 await command.ExecuteNonQueryAsync(cancellationToken);
                 transaction.Commit();
@@ -259,6 +329,58 @@ public sealed class Ledger : IAsyncDisposable
                         """;
                     await command.ExecuteNonQueryAsync(cancellationToken);
                     transaction.Commit();
+                    version = 3;
+                }
+
+                if (version == 3)
+                {
+                    using var transaction = connection.BeginTransaction();
+                    var command = connection.CreateCommand();
+                    command.Transaction = transaction;
+                    command.CommandText = """
+                        ALTER TABLE files RENAME COLUMN source_revision TO content_revision;
+                        ALTER TABLE files ADD COLUMN storage_area TEXT NOT NULL DEFAULT 'libraryData';
+                        ALTER TABLE files ADD COLUMN roles_json TEXT NOT NULL DEFAULT '["rootOriginal"]';
+                        ALTER TABLE files ADD COLUMN criticality TEXT NOT NULL DEFAULT 'archiveRequired';
+                        ALTER TABLE files ADD COLUMN provenance TEXT NOT NULL DEFAULT 'exactPhotoKitResource';
+                        ALTER TABLE files ADD COLUMN availability TEXT NOT NULL DEFAULT 'available';
+
+                        CREATE INDEX IF NOT EXISTS ix_files_content_revision
+                            ON files(file_id, content_revision, committed_at DESC);
+                        CREATE TABLE IF NOT EXISTS active_masters (
+                            asset_id TEXT PRIMARY KEY,
+                            file_id TEXT NOT NULL,
+                            content_revision TEXT NOT NULL,
+                            relative_path TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                            byte_count INTEGER NOT NULL,
+                            sha256 TEXT NOT NULL,
+                            observed_write_ticks INTEGER NOT NULL,
+                            activated_at TEXT NOT NULL
+                        );
+                        CREATE TABLE IF NOT EXISTS superseded_masters (
+                            asset_id TEXT NOT NULL,
+                            file_id TEXT NOT NULL,
+                            relative_path TEXT NOT NULL COLLATE NOCASE,
+                            byte_count INTEGER NOT NULL,
+                            sha256 TEXT NOT NULL,
+                            observed_write_ticks INTEGER NOT NULL,
+                            PRIMARY KEY(asset_id,file_id,relative_path)
+                        );
+                        CREATE TABLE IF NOT EXISTS pending_reuses (
+                            job_id TEXT NOT NULL,
+                            file_id TEXT NOT NULL,
+                            source_relative_path TEXT NOT NULL COLLATE NOCASE,
+                            source_storage_area TEXT NOT NULL,
+                            byte_count INTEGER NOT NULL,
+                            sha256 TEXT NOT NULL,
+                            observed_write_ticks INTEGER NOT NULL,
+                            PRIMARY KEY(job_id,file_id),
+                            FOREIGN KEY(job_id,file_id) REFERENCES files(job_id,file_id) ON DELETE CASCADE
+                        );
+                        PRAGMA user_version=4;
+                        """;
+                    await command.ExecuteNonQueryAsync(cancellationToken);
+                    transaction.Commit();
                 }
             }
 
@@ -278,6 +400,234 @@ public sealed class Ledger : IAsyncDisposable
             command.Parameters.AddWithValue("$jobId", Id(jobId));
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             return await reader.ReadAsync(cancellationToken) ? ReadJob(reader) : null;
+        }, cancellationToken);
+
+    public Task<LedgerActiveMaster?> GetActiveMasterAsync(
+        Guid assetId,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT asset_id,file_id,content_revision,relative_path,byte_count,sha256,
+                    observed_write_ticks,activated_at
+                FROM active_masters WHERE asset_id=$asset
+                """;
+            command.Parameters.AddWithValue("$asset", Id(assetId));
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            return await reader.ReadAsync(cancellationToken)
+                ? new LedgerActiveMaster(
+                    Guid.Parse(reader.GetString(0)),
+                    Guid.Parse(reader.GetString(1)),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.GetInt64(4),
+                    reader.GetString(5),
+                    reader.GetInt64(6),
+                    ParseDate(reader.GetString(7)))
+                : null;
+        }, cancellationToken);
+
+    public Task ActivateMasterAsync(
+        LedgerActiveMaster next,
+        LedgerSupersededMaster? superseded,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            using var transaction = connection.BeginTransaction();
+            if (superseded is not null)
+            {
+                var remember = connection.CreateCommand();
+                remember.Transaction = transaction;
+                remember.CommandText = """
+                    INSERT OR IGNORE INTO superseded_masters(
+                        asset_id,file_id,relative_path,byte_count,sha256,observed_write_ticks)
+                    VALUES($asset,$file,$path,$bytes,$sha,$ticks)
+                    """;
+                remember.Parameters.AddWithValue("$asset", Id(superseded.AssetId));
+                remember.Parameters.AddWithValue("$file", Id(superseded.FileId));
+                remember.Parameters.AddWithValue("$path", superseded.RelativePath);
+                remember.Parameters.AddWithValue("$bytes", superseded.ByteCount);
+                remember.Parameters.AddWithValue("$sha", superseded.Sha256);
+                remember.Parameters.AddWithValue("$ticks", superseded.ObservedWriteTicks);
+                await remember.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                INSERT INTO active_masters(
+                    asset_id,file_id,content_revision,relative_path,byte_count,sha256,observed_write_ticks,activated_at)
+                VALUES($asset,$file,$revision,$path,$bytes,$sha,$ticks,$activated)
+                ON CONFLICT(asset_id) DO UPDATE SET
+                    file_id=excluded.file_id,
+                    content_revision=excluded.content_revision,
+                    relative_path=excluded.relative_path,
+                    byte_count=excluded.byte_count,
+                    sha256=excluded.sha256,
+                    observed_write_ticks=excluded.observed_write_ticks,
+                    activated_at=excluded.activated_at
+                """;
+            command.Parameters.AddWithValue("$asset", Id(next.AssetId));
+            command.Parameters.AddWithValue("$file", Id(next.FileId));
+            command.Parameters.AddWithValue("$revision", next.ContentRevision);
+            command.Parameters.AddWithValue("$path", next.RelativePath);
+            command.Parameters.AddWithValue("$bytes", next.ByteCount);
+            command.Parameters.AddWithValue("$sha", next.Sha256);
+            command.Parameters.AddWithValue("$ticks", next.ObservedWriteTicks);
+            command.Parameters.AddWithValue("$activated", Date(next.ActivatedAt));
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            transaction.Commit();
+            return true;
+        }, cancellationToken);
+
+    public Task<IReadOnlyList<LedgerSupersededMaster>> GetSupersededMastersAsync(
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT asset_id,file_id,relative_path,byte_count,sha256,observed_write_ticks
+                FROM superseded_masters ORDER BY asset_id,file_id,relative_path
+                """;
+            var results = new List<LedgerSupersededMaster>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                results.Add(new LedgerSupersededMaster(
+                    Guid.Parse(reader.GetString(0)),
+                    Guid.Parse(reader.GetString(1)),
+                    reader.GetString(2),
+                    reader.GetInt64(3),
+                    reader.GetString(4),
+                    reader.GetInt64(5)));
+            }
+            return (IReadOnlyList<LedgerSupersededMaster>)results;
+        }, cancellationToken);
+
+    public Task RememberSupersededAsync(
+        LedgerSupersededMaster superseded,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT OR IGNORE INTO superseded_masters(
+                    asset_id,file_id,relative_path,byte_count,sha256,observed_write_ticks)
+                VALUES($asset,$file,$path,$bytes,$sha,$ticks)
+                """;
+            command.Parameters.AddWithValue("$asset", Id(superseded.AssetId));
+            command.Parameters.AddWithValue("$file", Id(superseded.FileId));
+            command.Parameters.AddWithValue("$path", superseded.RelativePath);
+            command.Parameters.AddWithValue("$bytes", superseded.ByteCount);
+            command.Parameters.AddWithValue("$sha", superseded.Sha256);
+            command.Parameters.AddWithValue("$ticks", superseded.ObservedWriteTicks);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            return true;
+        }, cancellationToken);
+
+    public Task<IReadOnlyList<LedgerPendingReuse>> GetPendingReusesAsync(
+        Guid jobId,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT job_id,file_id,source_relative_path,source_storage_area,byte_count,sha256,observed_write_ticks
+                FROM pending_reuses WHERE job_id=$job ORDER BY file_id
+                """;
+            command.Parameters.AddWithValue("$job", Id(jobId));
+            var results = new List<LedgerPendingReuse>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                results.Add(new LedgerPendingReuse(
+                    Guid.Parse(reader.GetString(0)),
+                    Guid.Parse(reader.GetString(1)),
+                    reader.GetString(2),
+                    Enum.Parse<StorageArea>(reader.GetString(3), true),
+                    reader.GetInt64(4),
+                    reader.GetString(5),
+                    reader.GetInt64(6)));
+            }
+            return (IReadOnlyList<LedgerPendingReuse>)results;
+        }, cancellationToken);
+
+    public Task CompleteReuseAsync(
+        Guid jobId,
+        Guid fileId,
+        bool preparedMaster,
+        long observedWriteTicks,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            using var transaction = connection.BeginTransaction();
+            if (preparedMaster)
+            {
+                var updateFile = connection.CreateCommand();
+                updateFile.Transaction = transaction;
+                updateFile.CommandText = """
+                    UPDATE files SET state='committed',observed_write_ticks=$ticks,committed_at=$committed
+                    WHERE job_id=$job AND file_id=$file AND state='skipped'
+                    """;
+                updateFile.Parameters.AddWithValue("$ticks", observedWriteTicks);
+                updateFile.Parameters.AddWithValue("$committed", Date(DateTimeOffset.UtcNow));
+                updateFile.Parameters.AddWithValue("$job", Id(jobId));
+                updateFile.Parameters.AddWithValue("$file", Id(fileId));
+                if (await updateFile.ExecuteNonQueryAsync(cancellationToken) == 1)
+                {
+                    var updateJob = connection.CreateCommand();
+                    updateJob.Transaction = transaction;
+                    updateJob.CommandText = """
+                        UPDATE jobs SET committed_files=committed_files+1,
+                            skipped_files=MAX(0,skipped_files-1),updated_at=$updated
+                        WHERE job_id=$job
+                        """;
+                    updateJob.Parameters.AddWithValue("$updated", Date(DateTimeOffset.UtcNow));
+                    updateJob.Parameters.AddWithValue("$job", Id(jobId));
+                    await updateJob.ExecuteNonQueryAsync(cancellationToken);
+                }
+            }
+            else
+            {
+                var updateFile = connection.CreateCommand();
+                updateFile.Transaction = transaction;
+                updateFile.CommandText = """
+                    UPDATE files SET observed_write_ticks=$ticks,committed_at=$committed
+                    WHERE job_id=$job AND file_id=$file AND state='skipped'
+                    """;
+                updateFile.Parameters.AddWithValue("$ticks", observedWriteTicks);
+                updateFile.Parameters.AddWithValue("$committed", Date(DateTimeOffset.UtcNow));
+                updateFile.Parameters.AddWithValue("$job", Id(jobId));
+                updateFile.Parameters.AddWithValue("$file", Id(fileId));
+                await updateFile.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            var delete = connection.CreateCommand();
+            delete.Transaction = transaction;
+            delete.CommandText = "DELETE FROM pending_reuses WHERE job_id=$job AND file_id=$file";
+            delete.Parameters.AddWithValue("$job", Id(jobId));
+            delete.Parameters.AddWithValue("$file", Id(fileId));
+            await delete.ExecuteNonQueryAsync(cancellationToken);
+            transaction.Commit();
+            return true;
+        }, cancellationToken);
+
+    public Task ForgetSupersededMasterAsync(
+        LedgerSupersededMaster superseded,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            var command = connection.CreateCommand();
+            command.CommandText = """
+                DELETE FROM superseded_masters
+                WHERE asset_id=$asset AND file_id=$file AND relative_path=$path
+                """;
+            command.Parameters.AddWithValue("$asset", Id(superseded.AssetId));
+            command.Parameters.AddWithValue("$file", Id(superseded.FileId));
+            command.Parameters.AddWithValue("$path", superseded.RelativePath);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+            return true;
         }, cancellationToken);
 
     public Task CreateJobAsync(
@@ -305,15 +655,21 @@ public sealed class Ledger : IAsyncDisposable
             fileCommand.Transaction = transaction;
             fileCommand.CommandText = """
                 INSERT INTO files(
-                    job_id,file_id,asset_id,source_revision,kind,proposed_path,relative_path,original_filename,
+                    job_id,file_id,asset_id,content_revision,storage_area,roles_json,criticality,provenance,availability,
+                    proposed_path,relative_path,original_filename,
                     capture_date,expected_bytes,expected_sha256,state)
-                VALUES($job,$file,$asset,$revision,$kind,$proposed,$path,$name,$capture,$bytes,$sha,'pending')
+                VALUES($job,$file,$asset,$revision,$area,$roles,$criticality,$provenance,$availability,
+                    $proposed,$path,$name,$capture,$bytes,$sha,'pending')
                 """;
             fileCommand.Parameters.Add("$job", SqliteType.Text);
             fileCommand.Parameters.Add("$file", SqliteType.Text);
             fileCommand.Parameters.Add("$asset", SqliteType.Text);
             fileCommand.Parameters.Add("$revision", SqliteType.Text);
-            fileCommand.Parameters.Add("$kind", SqliteType.Text);
+            fileCommand.Parameters.Add("$area", SqliteType.Text);
+            fileCommand.Parameters.Add("$roles", SqliteType.Text);
+            fileCommand.Parameters.Add("$criticality", SqliteType.Text);
+            fileCommand.Parameters.Add("$provenance", SqliteType.Text);
+            fileCommand.Parameters.Add("$availability", SqliteType.Text);
             fileCommand.Parameters.Add("$proposed", SqliteType.Text);
             fileCommand.Parameters.Add("$path", SqliteType.Text);
             fileCommand.Parameters.Add("$name", SqliteType.Text);
@@ -328,8 +684,12 @@ public sealed class Ledger : IAsyncDisposable
                     fileCommand.Parameters["$job"].Value = Id(job.JobId);
                     fileCommand.Parameters["$file"].Value = Id(file.FileId);
                     fileCommand.Parameters["$asset"].Value = Id(asset.AssetId);
-                    fileCommand.Parameters["$revision"].Value = file.SourceRevision;
-                    fileCommand.Parameters["$kind"].Value = EnumName(file.Kind);
+                    fileCommand.Parameters["$revision"].Value = file.ContentRevision;
+                    fileCommand.Parameters["$area"].Value = EnumName(file.StorageArea);
+                    fileCommand.Parameters["$roles"].Value = JsonSerializer.Serialize(file.Roles, LedgerJsonOptions);
+                    fileCommand.Parameters["$criticality"].Value = EnumName(file.Criticality);
+                    fileCommand.Parameters["$provenance"].Value = EnumName(file.Provenance);
+                    fileCommand.Parameters["$availability"].Value = EnumName(file.Availability);
                     fileCommand.Parameters["$proposed"].Value = proposedPaths[file.FileId];
                     fileCommand.Parameters["$path"].Value = acceptedPaths[file.FileId];
                     fileCommand.Parameters["$name"].Value = file.OriginalFilename;
@@ -373,29 +733,69 @@ public sealed class Ledger : IAsyncDisposable
 
     public Task<LedgerFile?> FindPriorCommittedAsync(
         Guid fileId,
-        string sourceRevision,
+        string contentRevision,
         CancellationToken cancellationToken = default) =>
         WithLockAsync(async connection =>
         {
             var command = connection.CreateCommand();
             command.CommandText = FileColumns + """
-                 WHERE file_id=$file AND source_revision=$revision AND state IN ('committed','skipped')
-                 ORDER BY committed_at DESC LIMIT 1
+                 WHERE file_id=$file AND content_revision=$revision AND state IN ('committed','skipped')
+                 ORDER BY committed_at DESC,rowid DESC LIMIT 1
                 """;
             command.Parameters.AddWithValue("$file", Id(fileId));
-            command.Parameters.AddWithValue("$revision", sourceRevision);
+            command.Parameters.AddWithValue("$revision", contentRevision);
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             return await reader.ReadAsync(cancellationToken) ? ReadFile(reader) : null;
         }, cancellationToken);
 
-    public Task<IReadOnlyDictionary<(Guid FileId, string SourceRevision), LedgerFile>> FindPriorCommittedAsync(
-        IReadOnlyCollection<(Guid FileId, string SourceRevision)> requested,
+    public Task<LedgerFile?> FindLatestCommittedDifferentRevisionAsync(
+        Guid fileId,
+        string contentRevision,
+        Guid excludingJobId,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            var command = connection.CreateCommand();
+            command.CommandText = FileColumns + """
+                 WHERE file_id=$file AND content_revision<>$revision AND job_id<>$job
+                    AND state IN ('committed','skipped')
+                 ORDER BY committed_at DESC,rowid DESC LIMIT 1
+                """;
+            command.Parameters.AddWithValue("$file", Id(fileId));
+            command.Parameters.AddWithValue("$revision", contentRevision);
+            command.Parameters.AddWithValue("$job", Id(excludingJobId));
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            return await reader.ReadAsync(cancellationToken) ? ReadFile(reader) : null;
+        }, cancellationToken);
+
+    public Task<LedgerFile?> FindPriorCommittedSameRevisionAsync(
+        Guid fileId,
+        string contentRevision,
+        Guid excludingJobId,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            var command = connection.CreateCommand();
+            command.CommandText = FileColumns + """
+                 WHERE file_id=$file AND content_revision=$revision AND job_id<>$job
+                    AND state IN ('committed','skipped')
+                 ORDER BY committed_at DESC,rowid DESC LIMIT 1
+                """;
+            command.Parameters.AddWithValue("$file", Id(fileId));
+            command.Parameters.AddWithValue("$revision", contentRevision);
+            command.Parameters.AddWithValue("$job", Id(excludingJobId));
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            return await reader.ReadAsync(cancellationToken) ? ReadFile(reader) : null;
+        }, cancellationToken);
+
+    public Task<IReadOnlyDictionary<(Guid FileId, string ContentRevision), LedgerFile>> FindPriorCommittedAsync(
+        IReadOnlyCollection<(Guid FileId, string ContentRevision)> requested,
         CancellationToken cancellationToken = default) =>
         WithLockAsync(async connection =>
         {
             const int batchSize = 200;
             var keys = requested.Distinct().ToArray();
-            var results = new Dictionary<(Guid FileId, string SourceRevision), LedgerFile>();
+            var results = new Dictionary<(Guid FileId, string ContentRevision), LedgerFile>();
             for (var offset = 0; offset < keys.Length; offset += batchSize)
             {
                 var count = Math.Min(batchSize, keys.Length - offset);
@@ -405,26 +805,26 @@ public sealed class Ledger : IAsyncDisposable
                 {
                     var fileParameter = "$file" + index;
                     var revisionParameter = "$revision" + index;
-                    predicates[index] = $"(file_id={fileParameter} AND source_revision={revisionParameter})";
+                    predicates[index] = $"(file_id={fileParameter} AND content_revision={revisionParameter})";
                     var key = keys[offset + index];
                     command.Parameters.AddWithValue(fileParameter, Id(key.FileId));
-                    command.Parameters.AddWithValue(revisionParameter, key.SourceRevision);
+                    command.Parameters.AddWithValue(revisionParameter, key.ContentRevision);
                 }
 
                 command.CommandText = FileColumns +
                     " WHERE state IN ('committed','skipped') AND (" +
                     string.Join(" OR ", predicates) +
-                    ") ORDER BY file_id,source_revision,committed_at DESC";
+                    ") ORDER BY file_id,content_revision,committed_at DESC,rowid DESC";
                 await using var reader = await command.ExecuteReaderAsync(cancellationToken);
                 while (await reader.ReadAsync(cancellationToken))
                 {
                     var file = ReadFile(reader);
-                    var key = (file.FileId, file.SourceRevision);
+                    var key = (file.FileId, file.ContentRevision);
                     results.TryAdd(key, file);
                 }
             }
 
-            return (IReadOnlyDictionary<(Guid FileId, string SourceRevision), LedgerFile>)results;
+            return (IReadOnlyDictionary<(Guid FileId, string ContentRevision), LedgerFile>)results;
         }, cancellationToken);
 
     public Task MarkSkippedAsync(
@@ -452,7 +852,9 @@ public sealed class Ledger : IAsyncDisposable
             var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText = """
-                UPDATE files SET state='skipped', relative_path=$path, committed_sha256=$sha,
+                UPDATE files SET state='skipped',
+                    relative_path=CASE WHEN $reuse=1 THEN relative_path ELSE $path END,
+                    committed_sha256=$sha,
                     committed_bytes=$bytes, committed_at=$committed, observed_write_ticks=$ticks
                 WHERE job_id=$job AND file_id=$file AND state='pending'
                 """;
@@ -461,6 +863,7 @@ public sealed class Ledger : IAsyncDisposable
             command.Parameters.Add("$bytes", SqliteType.Integer);
             command.Parameters.Add("$committed", SqliteType.Text);
             command.Parameters.Add("$ticks", SqliteType.Integer);
+            command.Parameters.Add("$reuse", SqliteType.Integer);
             command.Parameters.Add("$job", SqliteType.Text);
             command.Parameters.Add("$file", SqliteType.Text);
 
@@ -474,6 +877,21 @@ public sealed class Ledger : IAsyncDisposable
             updateObserved.Parameters.Add("$job", SqliteType.Text);
             updateObserved.Parameters.Add("$file", SqliteType.Text);
 
+            var rememberReuse = connection.CreateCommand();
+            rememberReuse.Transaction = transaction;
+            rememberReuse.CommandText = """
+                INSERT OR REPLACE INTO pending_reuses(
+                    job_id,file_id,source_relative_path,source_storage_area,byte_count,sha256,observed_write_ticks)
+                VALUES($job,$file,$path,$area,$bytes,$sha,$ticks)
+                """;
+            rememberReuse.Parameters.Add("$job", SqliteType.Text);
+            rememberReuse.Parameters.Add("$file", SqliteType.Text);
+            rememberReuse.Parameters.Add("$path", SqliteType.Text);
+            rememberReuse.Parameters.Add("$area", SqliteType.Text);
+            rememberReuse.Parameters.Add("$bytes", SqliteType.Integer);
+            rememberReuse.Parameters.Add("$sha", SqliteType.Text);
+            rememberReuse.Parameters.Add("$ticks", SqliteType.Integer);
+
             var skippedFiles = 0;
             long skippedBytes = 0;
             var verifiedOriginalFiles = 0;
@@ -485,13 +903,14 @@ public sealed class Ledger : IAsyncDisposable
                 command.Parameters["$bytes"].Value = Db(skip.Prior.CommittedBytes);
                 command.Parameters["$committed"].Value = Db(skip.Prior.CommittedAt is null ? null : Date(skip.Prior.CommittedAt.Value));
                 command.Parameters["$ticks"].Value = skip.ObservedWriteTicks;
+                command.Parameters["$reuse"].Value = skip.ReuseAtAcceptedPath ? 1 : 0;
                 command.Parameters["$job"].Value = Id(jobId);
                 command.Parameters["$file"].Value = Id(skip.FileId);
                 if (await command.ExecuteNonQueryAsync(cancellationToken) == 1)
                 {
                     skippedFiles++;
                     skippedBytes += skip.Prior.CommittedBytes ?? 0;
-                    if (skip.Prior.Kind == ExportFileKind.OriginalResource)
+                    if (skip.Prior.Roles.Contains(RepresentationRole.RootOriginal))
                     {
                         verifiedOriginalFiles++;
                     }
@@ -501,6 +920,18 @@ public sealed class Ledger : IAsyncDisposable
                 updateObserved.Parameters["$job"].Value = Id(skip.Prior.JobId);
                 updateObserved.Parameters["$file"].Value = Id(skip.Prior.FileId);
                 await updateObserved.ExecuteNonQueryAsync(cancellationToken);
+
+                if (skip.ReuseAtAcceptedPath)
+                {
+                    rememberReuse.Parameters["$job"].Value = Id(jobId);
+                    rememberReuse.Parameters["$file"].Value = Id(skip.FileId);
+                    rememberReuse.Parameters["$path"].Value = skip.Prior.RelativePath;
+                    rememberReuse.Parameters["$area"].Value = EnumName(skip.Prior.StorageArea);
+                    rememberReuse.Parameters["$bytes"].Value = skip.Prior.CommittedBytes!.Value;
+                    rememberReuse.Parameters["$sha"].Value = skip.Prior.CommittedSha256!;
+                    rememberReuse.Parameters["$ticks"].Value = skip.ObservedWriteTicks;
+                    await rememberReuse.ExecuteNonQueryAsync(cancellationToken);
+                }
             }
 
             if (skippedFiles > 0)
@@ -823,8 +1254,8 @@ public sealed class Ledger : IAsyncDisposable
                     failed_files=MAX(0,failed_files-$clearedFailures),
                     bytes_committed=bytes_committed+$bytes,
                     verified_original_files=verified_original_files+CASE WHEN (
-                        SELECT kind FROM files WHERE job_id=$job AND file_id=$file
-                    )='originalResource' THEN 1 ELSE 0 END,
+                        SELECT roles_json FROM files WHERE job_id=$job AND file_id=$file
+                    ) LIKE '%"rootOriginal"%' THEN 1 ELSE 0 END,
                     updated_at=$committed
                 WHERE job_id=$job
                 """;
@@ -872,6 +1303,133 @@ public sealed class Ledger : IAsyncDisposable
             updateJob.Parameters.AddWithValue("$updated", Date(DateTimeOffset.UtcNow));
             updateJob.Parameters.AddWithValue("$job", Id(jobId));
             await updateJob.ExecuteNonQueryAsync(cancellationToken);
+            transaction.Commit();
+            return true;
+        }, cancellationToken);
+
+    public Task MarkPromotionFailedAsync(
+        Guid jobId,
+        Guid fileId,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            using var transaction = connection.BeginTransaction();
+            var read = connection.CreateCommand();
+            read.Transaction = transaction;
+            read.CommandText = """
+                SELECT state,COALESCE(committed_bytes,0),roles_json
+                FROM files WHERE job_id=$job AND file_id=$file
+                """;
+            read.Parameters.AddWithValue("$job", Id(jobId));
+            read.Parameters.AddWithValue("$file", Id(fileId));
+            await using var reader = await read.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+            {
+                throw new ReceiverApiException(404, ErrorCodes.FileNotFound, "The promoted file is not in the job.");
+            }
+            var priorState = reader.GetString(0);
+            var bytes = reader.GetInt64(1);
+            var isOriginal = reader.GetString(2).Contains("\"rootOriginal\"", StringComparison.Ordinal);
+            await reader.DisposeAsync();
+            if (priorState == "promotionFailed")
+            {
+                transaction.Commit();
+                return true;
+            }
+            if (priorState is not ("committed" or "skipped"))
+            {
+                throw new ReceiverApiException(409, ErrorCodes.FileConflict, "Only a verified Master can fail promotion.");
+            }
+
+            var updateFile = connection.CreateCommand();
+            updateFile.Transaction = transaction;
+            updateFile.CommandText = """
+                UPDATE files SET state='promotionFailed'
+                WHERE job_id=$job AND file_id=$file AND state=$prior
+                """;
+            updateFile.Parameters.AddWithValue("$job", Id(jobId));
+            updateFile.Parameters.AddWithValue("$file", Id(fileId));
+            updateFile.Parameters.AddWithValue("$prior", priorState);
+            await updateFile.ExecuteNonQueryAsync(cancellationToken);
+
+            var updateJob = connection.CreateCommand();
+            updateJob.Transaction = transaction;
+            updateJob.CommandText = priorState == "committed"
+                ? """
+                    UPDATE jobs SET committed_files=MAX(0,committed_files-1),
+                        bytes_committed=MAX(0,bytes_committed-$bytes),
+                        verified_original_files=MAX(0,verified_original_files-$original),updated_at=$updated
+                    WHERE job_id=$job
+                    """
+                : """
+                    UPDATE jobs SET skipped_files=MAX(0,skipped_files-1),
+                        bytes_committed=MAX(0,bytes_committed-$bytes),
+                        verified_original_files=MAX(0,verified_original_files-$original),updated_at=$updated
+                    WHERE job_id=$job
+                    """;
+            updateJob.Parameters.AddWithValue("$bytes", bytes);
+            updateJob.Parameters.AddWithValue("$original", isOriginal ? 1 : 0);
+            updateJob.Parameters.AddWithValue("$updated", Date(DateTimeOffset.UtcNow));
+            updateJob.Parameters.AddWithValue("$job", Id(jobId));
+            await updateJob.ExecuteNonQueryAsync(cancellationToken);
+            transaction.Commit();
+            return true;
+        }, cancellationToken);
+
+    public Task MarkReuseFailedAsync(
+        Guid jobId,
+        Guid fileId,
+        CancellationToken cancellationToken = default) =>
+        WithLockAsync(async connection =>
+        {
+            using var transaction = connection.BeginTransaction();
+            var read = connection.CreateCommand();
+            read.Transaction = transaction;
+            read.CommandText = """
+                SELECT state,COALESCE(committed_bytes,0),roles_json FROM files
+                WHERE job_id=$job AND file_id=$file
+                """;
+            read.Parameters.AddWithValue("$job", Id(jobId));
+            read.Parameters.AddWithValue("$file", Id(fileId));
+            await using var reader = await read.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+            {
+                throw new ReceiverApiException(404, ErrorCodes.FileNotFound, "The reused file is not in the job.");
+            }
+            var state = reader.GetString(0);
+            var bytes = reader.GetInt64(1);
+            var isOriginal = reader.GetString(2).Contains("\"rootOriginal\"", StringComparison.Ordinal);
+            await reader.DisposeAsync();
+
+            if (state == "skipped")
+            {
+                var update = connection.CreateCommand();
+                update.Transaction = transaction;
+                update.CommandText = """
+                    UPDATE files SET state='reuseFailed' WHERE job_id=$job AND file_id=$file AND state='skipped';
+                    UPDATE jobs SET skipped_files=MAX(0,skipped_files-1),
+                        bytes_committed=MAX(0,bytes_committed-$bytes),
+                        verified_original_files=MAX(0,verified_original_files-$original),updated_at=$updated
+                    WHERE job_id=$job;
+                    """;
+                update.Parameters.AddWithValue("$job", Id(jobId));
+                update.Parameters.AddWithValue("$file", Id(fileId));
+                update.Parameters.AddWithValue("$bytes", bytes);
+                update.Parameters.AddWithValue("$original", isOriginal ? 1 : 0);
+                update.Parameters.AddWithValue("$updated", Date(DateTimeOffset.UtcNow));
+                await update.ExecuteNonQueryAsync(cancellationToken);
+            }
+            else if (state is not ("promotionFailed" or "reuseFailed"))
+            {
+                throw new ReceiverApiException(409, ErrorCodes.FileConflict, "Only a pending local reuse can fail.");
+            }
+
+            var delete = connection.CreateCommand();
+            delete.Transaction = transaction;
+            delete.CommandText = "DELETE FROM pending_reuses WHERE job_id=$job AND file_id=$file";
+            delete.Parameters.AddWithValue("$job", Id(jobId));
+            delete.Parameters.AddWithValue("$file", Id(fileId));
+            await delete.ExecuteNonQueryAsync(cancellationToken);
             transaction.Commit();
             return true;
         }, cancellationToken);
@@ -938,7 +1496,8 @@ public sealed class Ledger : IAsyncDisposable
             var mark = connection.CreateCommand();
             mark.Transaction = transaction;
             mark.CommandText = """
-                UPDATE files SET state='failed' WHERE job_id=$job AND file_id=$file AND state='pending'
+                UPDATE files SET state='failed'
+                WHERE job_id=$job AND file_id=$file AND state IN ('pending','promotionFailed','reuseFailed')
                 """;
             mark.Parameters.Add("$job", SqliteType.Text);
             mark.Parameters.Add("$file", SqliteType.Text);
@@ -1113,7 +1672,7 @@ public sealed class Ledger : IAsyncDisposable
                 SELECT j.created_at AS sort_created,j.job_id AS sort_job,0 AS row_kind,
                     j.job_id,j.created_at,j.updated_at,j.state,j.manifest_json,j.completed_at,
                     j.completion_request_json,j.report_json,j.abandon_removed_partial_files,
-                    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+                    NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
                     0 AS file_order
                 FROM jobs AS j
                 WHERE j.state IN ('completed','completedWithFailures')
@@ -1122,7 +1681,8 @@ public sealed class Ledger : IAsyncDisposable
 
                 SELECT j.created_at,j.job_id,1,
                     NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
-                    f.job_id,f.file_id,f.asset_id,f.source_revision,f.kind,f.proposed_path,
+                    f.job_id,f.file_id,f.asset_id,f.content_revision,f.storage_area,f.roles_json,
+                    f.criticality,f.provenance,f.availability,f.proposed_path,
                     f.relative_path,f.original_filename,f.capture_date,f.expected_bytes,
                     f.expected_sha256,f.state,f.committed_sha256,f.committed_bytes,
                     f.committed_at,f.observed_write_ticks,f.bytes_transferred,
@@ -1331,25 +1891,32 @@ public sealed class Ledger : IAsyncDisposable
         Guid.Parse(reader.GetString(offset + 1)),
         Guid.Parse(reader.GetString(offset + 2)),
         reader.GetString(offset + 3),
-        Enum.Parse<ExportFileKind>(reader.GetString(offset + 4), true),
-        reader.GetString(offset + 5),
-        reader.GetString(offset + 6),
-        reader.GetString(offset + 7),
-        reader.IsDBNull(offset + 8) ? null : ParseDate(reader.GetString(offset + 8)),
-        reader.IsDBNull(offset + 9) ? null : reader.GetInt64(offset + 9),
-        reader.IsDBNull(offset + 10) ? null : reader.GetString(offset + 10),
+        Enum.Parse<StorageArea>(reader.GetString(offset + 4), true),
+        JsonSerializer.Deserialize<IReadOnlyList<RepresentationRole>>(reader.GetString(offset + 5), LedgerJsonOptions)
+            ?? Array.Empty<RepresentationRole>(),
+        Enum.Parse<Criticality>(reader.GetString(offset + 6), true),
+        Enum.Parse<Provenance>(reader.GetString(offset + 7), true),
+        Enum.Parse<Availability>(reader.GetString(offset + 8), true),
+        reader.GetString(offset + 9),
+        reader.GetString(offset + 10),
         reader.GetString(offset + 11),
-        reader.IsDBNull(offset + 12) ? null : reader.GetString(offset + 12),
+        reader.IsDBNull(offset + 12) ? null : ParseDate(reader.GetString(offset + 12)),
         reader.IsDBNull(offset + 13) ? null : reader.GetInt64(offset + 13),
-        reader.IsDBNull(offset + 14) ? null : ParseDate(reader.GetString(offset + 14)),
-        reader.IsDBNull(offset + 15) ? null : reader.GetInt64(offset + 15),
-        reader.GetInt64(offset + 16));
+        reader.IsDBNull(offset + 14) ? null : reader.GetString(offset + 14),
+        reader.GetString(offset + 15),
+        reader.IsDBNull(offset + 16) ? null : reader.GetString(offset + 16),
+        reader.IsDBNull(offset + 17) ? null : reader.GetInt64(offset + 17),
+        reader.IsDBNull(offset + 18) ? null : ParseDate(reader.GetString(offset + 18)),
+        reader.IsDBNull(offset + 19) ? null : reader.GetInt64(offset + 19),
+        reader.GetInt64(offset + 20));
 
     private const string FileColumns = """
-        SELECT job_id,file_id,asset_id,source_revision,kind,proposed_path,relative_path,original_filename,
-            capture_date,expected_bytes,expected_sha256,state,committed_sha256,committed_bytes,
+        SELECT job_id,file_id,asset_id,content_revision,storage_area,roles_json,criticality,provenance,availability,
+            proposed_path,relative_path,original_filename,capture_date,expected_bytes,expected_sha256,state,committed_sha256,committed_bytes,
             committed_at,observed_write_ticks,bytes_transferred FROM files
         """;
+
+    private static readonly JsonSerializerOptions LedgerJsonOptions = JsonDefaults.Create();
 
     private static string Id(Guid value) => value.ToString("D");
     private static string Date(DateTimeOffset value) => value.ToUniversalTime().ToString("O");

@@ -447,7 +447,7 @@ final class OrganizeWorkerConcurrencyTests: XCTestCase {
         XCTAssertEqual(buckets.map(\.bucketID), OrganizeStorageAnalysisBucketID.allCases)
         XCTAssertEqual(buckets.count, 8)
         let byID = Dictionary(uniqueKeysWithValues: buckets.map { ($0.bucketID, $0) })
-        XCTAssertEqual(byID[.photos]?.itemCount, 1)
+        XCTAssertEqual(byID[.photos]?.itemCount, 2)
         XCTAssertEqual(byID[.screenshots]?.itemCount, 1)
         XCTAssertEqual(byID[.videos]?.itemCount, 1)
         XCTAssertEqual(byID[.live]?.itemCount, 1)

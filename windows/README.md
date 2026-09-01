@@ -1,10 +1,10 @@
 # MB Photos Windows Receiver
 
-The receiver is a deliberately small companion to the iOS exporter. It listens while the app is running, including when its WPF window is hidden in the notification area, accepts one certificate-pinned session on a private IPv4 LAN, writes into a user-confirmed backup root, and never deletes committed files.
+The Windows app receives a portable MB Photos library from iOS and can reopen that library to browse and export its verified representations. It listens while the receiver is running, including when its WPF window is hidden in the notification area, and accepts one certificate-pinned session on a private IPv4 LAN.
 
 ## Projects
 
-- `src/MBPhotos.Receiver.Core` contains the protocol-v1 HTTPS host, pairing, SQLite ledger, path security, incremental planning, chunk transfer, verification, reports, and diagnostics. It targets .NET 10 in production and conditionally targets .NET 7 only when built by the older SDK installed on the repository's macOS host.
+- `src/MBPhotos.Receiver.Core` contains the protocol-v2 HTTPS host, pairing, SQLite ledger, path security, incremental planning, chunk transfer, Master promotion, portable catalog, exact-copy variant export, reports, and diagnostics. It targets .NET 10 in production and conditionally targets .NET 7 only when built by the older SDK installed on the repository's macOS host.
 - `src/MBPhotos.Receiver.Wpf` is the .NET 10 Windows x64 UI and portable single-file publish target.
 - `tests/MBPhotos.Receiver.Tests` is a dependency-free console test runner. It executes the shared protocol fixtures and every normative Windows path vector, then exercises the real SQLite/transfer implementation.
 
@@ -40,17 +40,24 @@ The script publishes `MBPhotosReceiver.exe`, signs it with SHA-256 and an RFC 31
 
 ## Receiver behavior
 
-- Choosing an uninitialized folder requires the explicit initialization checkbox. Nonempty reserved `Metadata`, `Reports`, or `.mbphotos` paths are rejected and left untouched.
+- Choosing an uninitialized folder requires the explicit initialization checkbox. Nonempty reserved `Master` or `MB Photos Data` paths are rejected and left untouched. Legacy v1 destinations are detected and rejected without modification.
 - Each process run creates a self-signed process-lifetime certificate, a 256-bit five-minute single-use pairing token, and a process-lifetime bearer session. Windows uses a temporary current-user key container because Schannel cannot serve TLS from an ephemeral private key; it is not persisted beyond certificate disposal. Tokens, filenames, album titles, and location values are redacted from diagnostics.
 - Uploads use sequential 8 MiB chunks. Receipts, the first observed total for unknown-size outputs, and original receipt timestamps are durable in SQLite. Retrying an acknowledged chunk is idempotent.
-- Each chunk and committed file is SHA-256 verified. Final files are moved atomically from `.mbphotos/partial/{jobId}`; a mismatch is quarantined until retry or abandonment.
+- Each chunk and complete file is SHA-256 verified. Files are received below `MB Photos Data/.mbphotos/staging`; verified support resources are retained below `MB Photos Data/Resources`, and verified current representations are safely promoted below `Master`.
 - Crash reconciliation truncates bytes flushed without a ledger receipt and recognizes a hash-valid final file moved before its commit transaction.
-- Existing or externally changed files are never overwritten. A single stable `~{fileId-prefix}` collision suffix is allowed; if that is occupied the receiver returns `path_conflict`.
+- Existing or externally changed files are never overwritten. Updating a managed Master representation first verifies the prior cataloged hash; a mismatch stops that asset's promotion and leaves the external file untouched.
 - All output paths are revalidated at the Windows security boundary. Rooted/traversal/device paths and any existing symbolic-link or junction ancestor are rejected.
-- A changed PhotoKit identifier is never heuristically associated in v1. Without stable IDs, the safe fallback is a full upload to a non-overwriting path; this avoids a false incremental skip.
+- Stable per-resource identities and content revisions allow a nondestructive edit to replace only the current Master representation while unchanged originals and Live Photo motion remain verified.
 - Completion can terminalize explicitly declared per-file failures as `completedWithFailures`. The completion request and report are stored transactionally, so an identical retry recovers a lost response; a different retry returns `job_conflict`.
 - Closing the window keeps an active transfer running in the notification area. Double-click the tray icon to reopen it, or use its Show, Stop, and Exit commands. Completion and transfer errors bring the window back and show a notification. Stop and Exit pause active jobs safely before releasing the destination.
 - Receiver startup, shutdown, SQLite initialization, certificate creation, QR generation, diagnostics logging, and manifest output never run on the WPF dispatcher. Progress is coalesced to at most ten ordinary updates per second; terminal and error activity is delivered promptly.
-- Portable metadata is rebuilt through a receiver-owned scratch SQLite index and streamed into atomic JSONL/CSV/report files, bounding memory to the currently decoded protocol job instead of retaining the entire completed backup history.
+- Portable metadata is published as immutable catalog generations with an atomic `current.json` pointer. Catalog paths are relative to the library root, so moving the complete root preserves the library.
 
-The receiver exposes exactly the endpoints documented in `protocol/openapi.yaml`. Tray residency is process-local: it does not install a service, register for autostart, install an updater, or create a firewall rule. Choosing Exit ends the listener and the process.
+The selected root has two intentionally different areas:
+
+- `Master/` contains only one current photo or video per successfully synced asset and may be copied on its own.
+- `MB Photos Data/` contains exact originals, Live Photo motion, adjustment resources, thumbnails, catalogs, reports, and receiver state required for reversible exports.
+
+Opening a library in the Windows app enables exact-copy export of the current Master file, individual untouched originals, and current/original Live Photo MOV resources. These exports do not transcode media or modify Master.
+
+The receiver exposes exactly the protocol-v2 endpoints documented in `protocol/openapi-v2.yaml`. Tray residency is process-local: it does not install a service, register for autostart, install an updater, or create a firewall rule. Choosing Exit ends the listener and the process.

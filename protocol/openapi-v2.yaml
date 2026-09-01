@@ -1,0 +1,417 @@
+openapi: 3.1.0
+info:
+  title: MB Photos Portable Library Receiver API
+  version: 2.0.0
+  summary: Authenticated transfer into a portable Master and reversible Library Data archive
+  description: |
+    Protocol v2 runs over certificate-pinned HTTPS on a private IPv4 LAN. It creates
+    destination format v2 only. A v1 destination is rejected before job creation and
+    remains untouched. See README.md for resource-role, promotion, and path invariants.
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+servers:
+  - url: https://{host}:{port}
+    description: Ephemeral receiver advertised by the v2 pairing QR code
+    variables:
+      host:
+        default: 192.168.1.10
+      port:
+        default: "49152"
+tags:
+  - name: Pairing
+  - name: Jobs
+  - name: Files
+paths:
+  /v2/pair:
+    post:
+      tags: [Pairing]
+      operationId: pairV2
+      summary: Redeem a one-time v2 QR pairing token
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: schemas/v2/api.schema.json#/$defs/PairRequest
+            examples:
+              fixture:
+                externalValue: fixtures/v2/pair.request.json
+      responses:
+        "200":
+          description: Session issued for a fresh destination-format-v2 library
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema:
+                $ref: schemas/v2/api.schema.json#/$defs/PairResponse
+              examples:
+                fixture:
+                  externalValue: fixtures/v2/pair.response.json
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "426":
+          $ref: "#/components/responses/ProtocolMismatch"
+        default:
+          $ref: "#/components/responses/Error"
+  /v2/jobs:
+    post:
+      tags: [Jobs]
+      operationId: createOrReconcileJobV2
+      summary: Submit a frozen portable-library manifest
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: schemas/v2/api.schema.json#/$defs/CreateJobRequest
+            examples:
+              fixture:
+                externalValue: fixtures/v2/create-job.request.json
+              scenarioMatrix:
+                externalValue: fixtures/v2/scenario-matrix.request.json
+      responses:
+        "200":
+          description: Receiver-authoritative upload, resume, skip, and path decisions
+          content:
+            application/json:
+              schema:
+                $ref: schemas/v2/api.schema.json#/$defs/CreateJobResponse
+              examples:
+                fixture:
+                  externalValue: fixtures/v2/create-job.response.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "507":
+          $ref: "#/components/responses/InsufficientStorage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v2/jobs/{jobId}:
+    get:
+      tags: [Jobs]
+      operationId: getJobV2
+      summary: Reconcile durable receiver state for an interrupted v2 job
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: Current decisions and committed verified-file receipts
+          content:
+            application/json:
+              schema:
+                $ref: schemas/v2/api.schema.json#/$defs/JobStatusResponse
+              examples:
+                fixture:
+                  externalValue: fixtures/v2/job-status.response.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+  /v2/jobs/{jobId}/files/{fileId}/chunks/{chunkIndex}:
+    put:
+      tags: [Files]
+      operationId: uploadChunkV2
+      summary: Idempotently append one verified sequential chunk
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - $ref: "#/components/parameters/FileId"
+        - $ref: "#/components/parameters/ChunkIndex"
+        - $ref: "#/components/parameters/ContentRange"
+        - $ref: "#/components/parameters/ChunkSha256"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              maxLength: 8388608
+      responses:
+        "200":
+          description: Chunk bytes flushed and the contiguous receipt persisted
+          content:
+            application/json:
+              schema:
+                $ref: schemas/v2/api.schema.json#/$defs/UploadChunkResponse
+              examples:
+                fixture:
+                  externalValue: fixtures/v2/chunk-receipt.response.json
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "507":
+          $ref: "#/components/responses/InsufficientStorage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v2/jobs/{jobId}/files/{fileId}/commit:
+    post:
+      tags: [Files]
+      operationId: commitFileV2
+      summary: Verify a complete staged file and record its accepted library-relative path
+      description: Master promotion remains guarded by asset-level conflict checks and catalog generation.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - $ref: "#/components/parameters/FileId"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: schemas/v2/api.schema.json#/$defs/CommitFileRequest
+            examples:
+              fixture:
+                externalValue: fixtures/v2/commit-file.request.json
+      responses:
+        "200":
+          description: Exact staged bytes were verified and durably committed
+          content:
+            application/json:
+              schema:
+                $ref: schemas/v2/api.schema.json#/$defs/CommitFileResponse
+              examples:
+                fixture:
+                  externalValue: fixtures/v2/commit-file.response.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "507":
+          $ref: "#/components/responses/InsufficientStorage"
+        default:
+          $ref: "#/components/responses/Error"
+  /v2/jobs/{jobId}/complete:
+    post:
+      tags: [Jobs]
+      operationId: completeJobV2
+      summary: Promote safe Master representations and publish a catalog generation
+      description: |
+        Completion preserves an existing verified Master on a required-resource failure or
+        master conflict. Archive-resource failures may still publish the new Master while
+        marking the asset archive incomplete in the catalog.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: schemas/v2/api.schema.json#/$defs/CompleteJobRequest
+            examples:
+              clean:
+                externalValue: fixtures/v2/complete-job.request.json
+              withFailures:
+                externalValue: fixtures/v2/complete-job-with-failures.request.json
+      responses:
+        "200":
+          description: Stored report and immutable catalog-generation paths
+          content:
+            application/json:
+              schema:
+                $ref: schemas/v2/api.schema.json#/$defs/CompleteJobResponse
+              examples:
+                clean:
+                  externalValue: fixtures/v2/completion-report.response.json
+                withFailures:
+                  externalValue: fixtures/v2/completion-report-with-failures.response.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        default:
+          $ref: "#/components/responses/Error"
+  /v2/jobs/{jobId}/abandon:
+    post:
+      tags: [Jobs]
+      operationId: abandonJobV2
+      summary: Delete only uncommitted receiver-owned staging data
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: schemas/v2/api.schema.json#/$defs/AbandonJobRequest
+            examples:
+              fixture:
+                externalValue: fixtures/v2/abandon-job.request.json
+      responses:
+        "200":
+          description: Staging removed; prior Master and catalogs remain untouched
+          content:
+            application/json:
+              schema:
+                $ref: schemas/v2/api.schema.json#/$defs/AbandonJobResponse
+              examples:
+                fixture:
+                  externalValue: fixtures/v2/abandon-job.response.json
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        default:
+          $ref: "#/components/responses/Error"
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: base64url-256-bit
+      description: Process-scoped token returned by POST /v2/pair.
+  parameters:
+    JobId:
+      name: jobId
+      in: path
+      required: true
+      schema:
+        $ref: schemas/v2/models.schema.json#/$defs/Uuid
+    FileId:
+      name: fileId
+      in: path
+      required: true
+      schema:
+        $ref: schemas/v2/models.schema.json#/$defs/Uuid
+    ChunkIndex:
+      name: chunkIndex
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 0
+    ContentRange:
+      name: Content-Range
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: ^bytes [0-9]+-[0-9]+/[0-9]+$
+    ChunkSha256:
+      name: X-Chunk-SHA256
+      in: header
+      required: true
+      schema:
+        $ref: schemas/v2/models.schema.json#/$defs/Sha256
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      schema:
+        $ref: schemas/v2/models.schema.json#/$defs/Uuid
+  schemas:
+    Destination:
+      $ref: schemas/v2/models.schema.json#/$defs/Destination
+    ExportProfile:
+      $ref: schemas/v2/models.schema.json#/$defs/ExportProfile
+    ExportJob:
+      $ref: schemas/v2/models.schema.json#/$defs/ExportJob
+    ExportAsset:
+      $ref: schemas/v2/models.schema.json#/$defs/ExportAsset
+    ExportFile:
+      $ref: schemas/v2/models.schema.json#/$defs/ExportFile
+    CatalogAsset:
+      $ref: schemas/v2/catalog.schema.json#/$defs/CatalogAsset
+    CatalogPointer:
+      $ref: schemas/v2/catalog.schema.json#/$defs/CatalogPointer
+    LibraryDescriptor:
+      $ref: schemas/v2/catalog.schema.json#/$defs/LibraryDescriptor
+    CompletionReport:
+      $ref: schemas/v2/models.schema.json#/$defs/CompletionReport
+    ApiError:
+      $ref: schemas/v2/models.schema.json#/$defs/ApiError
+  responses:
+    Error:
+      description: Structured receiver error
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse
+          examples:
+            fixture:
+              externalValue: fixtures/v2/api-error.response.json
+    BadRequest:
+      description: Invalid request, unsafe path, or chunk sequence
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse
+    Unauthorized:
+      description: Missing or invalid process-scoped bearer token
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse
+    NotFound:
+      description: Job or file not found
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse
+    Conflict:
+      description: Identifier, destination, path, or external Master conflict
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse
+    Gone:
+      description: Pairing token expired
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse
+    ProtocolMismatch:
+      description: Unsupported protocol or v1 destination format; no job was created
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse
+    Unprocessable:
+      description: Uploaded bytes failed exact size or SHA-256 verification
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse
+    InsufficientStorage:
+      description: Destination lacks required free space
+      content:
+        application/json:
+          schema:
+            $ref: schemas/v2/api.schema.json#/$defs/ErrorResponse

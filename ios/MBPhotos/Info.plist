@@ -39,7 +39,7 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Transfer your selected photos directly to your Windows PC over your private local network.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Read and organize your photos and videos. Items you explicitly confirm for removal are moved to Apple Photos’ Recently Deleted collection.</string>
+	<string>Select photos and videos to transfer to your Windows PC. Optional organize actions move only items you confirm to Recently Deleted.</string>
 	<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
 	<true/>
 	<key>UIApplicationSceneManifest</key>

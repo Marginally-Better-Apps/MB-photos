@@ -1,0 +1,63 @@
+{
+  "catalogFormatVersion": 2,
+  "assetId": "77777777-7777-4777-8777-777777777777",
+  "sourceLocalIdentifier": "UNEDITED-LIVE/L0/001",
+  "sourceRevision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "mediaType": "photo",
+  "mediaSubtypes": ["livePhoto", "hdr"],
+  "creationDate": "2026-08-23T21:14:55Z",
+  "modificationDate": null,
+  "isEdited": false,
+  "masterFileId": "55555555-5555-4555-8555-555555555555",
+  "livePhotoRelationships": {
+    "currentStillFileId": "55555555-5555-4555-8555-555555555555",
+    "currentMotionFileId": "66666666-6666-4666-8666-666666666666",
+    "originalStillFileId": "55555555-5555-4555-8555-555555555555",
+    "originalMotionFileId": "66666666-6666-4666-8666-666666666666"
+  },
+  "archiveState": "complete",
+  "files": [
+    {
+      "fileId": "55555555-5555-4555-8555-555555555555",
+      "contentRevision": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "storageArea": "master",
+      "roles": ["masterCurrent", "rootOriginal"],
+      "criticality": "masterRequired",
+      "provenance": "exactPhotoKitResource",
+      "photoKitResourceType": "photo",
+      "photoKitResourceTypeRaw": 1,
+      "originalFilename": "IMG_1300.HEIC",
+      "uniformTypeIdentifier": "public.heic",
+      "contentType": "image/heic",
+      "pixelWidth": 4032,
+      "pixelHeight": 3024,
+      "durationMilliseconds": null,
+      "byteCount": 4839211,
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "captureDate": "2026-08-23T21:14:55Z",
+      "acceptedRelativePath": "Master/2026/2026-08/2026-08-23/IMG_1300.HEIC",
+      "availability": "available"
+    },
+    {
+      "fileId": "66666666-6666-4666-8666-666666666666",
+      "contentRevision": "1212121212121212121212121212121212121212121212121212121212121212",
+      "storageArea": "libraryData",
+      "roles": ["currentLiveMotion", "originalLiveMotion"],
+      "criticality": "archiveRequired",
+      "provenance": "exactPhotoKitResource",
+      "photoKitResourceType": "pairedVideo",
+      "photoKitResourceTypeRaw": 9,
+      "originalFilename": "IMG_1300.MOV",
+      "uniformTypeIdentifier": "com.apple.quicktime-movie",
+      "contentType": "video/quicktime",
+      "pixelWidth": 1920,
+      "pixelHeight": 1440,
+      "durationMilliseconds": 3020,
+      "byteCount": 45123210,
+      "sha256": "1212121212121212121212121212121212121212121212121212121212121212",
+      "captureDate": "2026-08-23T21:14:55Z",
+      "acceptedRelativePath": "MB Photos Data/Resources/77777777-7777-4777-8777-777777777777/66666666-6666-4666-8666-666666666666.MOV",
+      "availability": "available"
+    }
+  ]
+}

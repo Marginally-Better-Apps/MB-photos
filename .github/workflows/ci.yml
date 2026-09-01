@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   protocol:
-    name: Protocol v1 contract
+    name: Protocol v1 + v2 contracts
     runs-on: ubuntu-latest
     timeout-minutes: 10
 

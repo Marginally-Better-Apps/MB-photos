@@ -10,10 +10,10 @@ The local database stores export jobs, source revision identifiers, destination 
 
 ## Windows receiver
 
-The receiver accesses only a folder selected by the user. It stores verified photos, portable manifests, completion reports, and its resumable ledger in that folder. Application diagnostics are stored locally and exclude photo filenames, album names, GPS data, and pairing credentials.
+The receiver accesses only a library root and export destinations selected by the user. Current media is stored below `Master`; original resources, Live Photo motion, portable catalogs, thumbnails, completion reports, and resumable state are stored below `MB Photos Data`. Application diagnostics are stored locally and exclude photo filenames, album names, GPS data, and pairing credentials.
 
 ## Network use
 
 Media transfer occurs directly between the two devices on the local network. No media, metadata, or diagnostics are sent to the project maintainers or another service.
 
-Exact originals retain their embedded metadata. The location-removal option affects generated JPEGs and exported manifests; it cannot remove metadata from an exact original without violating the byte-preservation guarantee.
+Exact PhotoKit resources retain their embedded metadata, including location. MB Photos does not rewrite Master or archived resources to remove location because doing so would violate the byte-preservation guarantee.

@@ -1,6 +1,8 @@
 # MB Photos for iOS
 
-The iOS 18+ client organizes the user's PhotoKit library, stages review decisions locally, moves only explicitly confirmed items to Apple Photos’ Recently Deleted collection, and sends exact original resources plus optional current JPEG renditions to the paired Windows receiver.
+The iOS 18+ client organizes the user's PhotoKit library, stages review decisions locally, moves only explicitly confirmed items to Apple Photos’ Recently Deleted collection, and builds a portable Windows library from exact PhotoKit resource bytes.
+
+Protocol v2 creates one exact, full-quality current still or video per asset under the library root's `Master/` folder. Live Photos contribute only their current still to `Master/`; their paired MOV, untouched originals, edit resources, catalog data, and small generated browsing thumbnail are stored under `MB Photos Data/`. Edited media requires PhotoKit's full-size modified resource and never falls back to a generated JPEG or transcode. The iOS app preserves stable file identities across nondestructive edits so unchanged originals do not need to transfer again.
 
 ## Generate and build
 

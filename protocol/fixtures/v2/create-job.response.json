@@ -1,0 +1,57 @@
+{
+  "protocolVersion": 2,
+  "jobId": "11111111-1111-4111-8111-111111111111",
+  "destination": {
+    "destinationId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    "displayName": "Portable Photo Library (D:)",
+    "createdAt": "2026-08-31T15:01:10Z",
+    "freeBytes": 812345678901,
+    "pathPolicyVersion": 2,
+    "destinationFormatVersion": 2
+  },
+  "state": "transferring",
+  "decisions": [
+    {
+      "fileId": "33333333-3333-4333-8333-333333333333",
+      "action": "resume",
+      "acceptedRelativePath": "Master/2026/2026-08/2026-08-23/IMG_1234.HEIC",
+      "nextChunkIndex": 1,
+      "acknowledgedChunks": [{ "firstIndex": 0, "lastIndexInclusive": 0 }],
+      "reason": "partial"
+    },
+    {
+      "fileId": "44444444-4444-4444-8444-444444444444",
+      "action": "upload",
+      "acceptedRelativePath": "MB Photos Data/Resources/22222222-2222-4222-8222-222222222222/44444444-4444-4444-8444-444444444444.HEIC",
+      "nextChunkIndex": 0,
+      "acknowledgedChunks": [],
+      "reason": "new"
+    },
+    {
+      "fileId": "99999999-9999-4999-8999-999999999999",
+      "action": "upload",
+      "acceptedRelativePath": "MB Photos Data/Resources/22222222-2222-4222-8222-222222222222/99999999-9999-4999-8999-999999999999.plist",
+      "nextChunkIndex": 0,
+      "acknowledgedChunks": [],
+      "reason": "new"
+    },
+    {
+      "fileId": "55555555-5555-4555-8555-555555555555",
+      "action": "skip",
+      "acceptedRelativePath": "Master/2026/2026-08/2026-08-23/IMG_1300.HEIC",
+      "nextChunkIndex": 0,
+      "acknowledgedChunks": [],
+      "reason": "verified"
+    },
+    {
+      "fileId": "66666666-6666-4666-8666-666666666666",
+      "action": "upload",
+      "acceptedRelativePath": "MB Photos Data/Resources/77777777-7777-4777-8777-777777777777/66666666-6666-4666-8666-666666666666.MOV",
+      "nextChunkIndex": 0,
+      "acknowledgedChunks": [],
+      "reason": "new"
+    }
+  ],
+  "createdAt": "2026-08-31T15:03:00Z",
+  "updatedAt": "2026-08-31T15:03:02Z"
+}

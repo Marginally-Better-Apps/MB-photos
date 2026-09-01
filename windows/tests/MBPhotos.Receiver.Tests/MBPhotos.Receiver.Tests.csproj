@@ -9,6 +9,6 @@
   <ItemGroup>
     <ProjectReference Include="../../src/MBPhotos.Receiver.Core/MBPhotos.Receiver.Core.csproj" />
     <None Include="../../../protocol/test-vectors/windows-paths.json" Link="Protocol/windows-paths.json" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="../../../protocol/fixtures/v1/*.json" Link="Protocol/Fixtures/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../protocol/fixtures/v2/*.json" Link="Protocol/Fixtures/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

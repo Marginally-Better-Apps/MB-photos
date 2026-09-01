@@ -1,16 +1,87 @@
-# MB Photos local-transfer protocol v1
+# MB Photos local-transfer protocols
 
-This directory is the language-neutral contract between the iOS exporter and the Windows receiver. Protocol v1 is intentionally local-only: the receiver binds to one private IPv4 interface, advertises a short-lived QR payload, and stops listening when its process exits.
+This directory is the language-neutral contract between the iOS exporter and the Windows receiver. Both protocols are intentionally local-only: the receiver binds to one private IPv4 interface, advertises a short-lived QR payload, and stops listening when its process exits. Protocol v2 is the active portable-library contract. Protocol v1 is frozen for reference; every file below `schemas/v1/` and `fixtures/v1/`, plus `openapi.yaml`, remains byte-untouched.
 
 ## Contract files
 
-- `openapi.yaml` describes every HTTPS operation and wire header.
+- `openapi-v2.yaml` describes the active v2 HTTPS surface; `openapi.yaml` is the frozen v1 surface.
+- `schemas/v2/models.schema.json` defines v2 transfer models and enum wire values.
+- `schemas/v2/catalog.schema.json` defines `library.json`, the catalog pointer, and JSONL record shapes.
+- `schemas/v2/api.schema.json` defines every v2 JSON request and response envelope.
+- `fixtures/v2/` contains endpoint fixtures, catalog fixtures, and a resource scenario matrix.
 - `schemas/v1/models.schema.json` defines persistent and shared domain models.
 - `schemas/v1/api.schema.json` defines every JSON request and response envelope.
 - `fixtures/v1/` contains a complete example exchange for a Live Photo plus a converted HEIC still.
 - `test-vectors/windows-paths.json` is the normative cross-language suite for filename sanitization, path validation, shortening, and collision handling.
 
-Schemas use JSON Schema 2020-12. JSON property names are camelCase. UUIDs are transmitted in canonical hyphenated form, timestamps are RFC 3339 UTC strings, SHA-256 values are 64 lowercase hexadecimal characters, and byte counts are non-negative JSON integers.
+Schemas use JSON Schema 2020-12. JSON property names and all v2 string-enum values use the exact camelCase spelling in the schemas and fixtures. UUIDs are transmitted in canonical hyphenated form, timestamps are RFC 3339 UTC strings, SHA-256 values are 64 lowercase hexadecimal characters, and byte counts are non-negative JSON integers.
+
+## Protocol v2: portable library
+
+The v2 QR URI uses `v=2`, pairing is `POST /v2/pair`, and every job route is under `/v2`. All version constants are `2`: protocol, profile, path policy, destination format, catalog format, and library format. `Destination` always includes `destinationFormatVersion: 2`. A receiver must reject a v1 destination with `destination_format_mismatch` before it creates a job or changes that destination; paused v1 jobs cannot be resumed as v2 jobs.
+
+V2 exposes one profile only:
+
+```json
+{ "kind": "portableLibrary", "profileVersion": 2 }
+```
+
+Embedded metadata is preserved exactly. There is no v2 location-removal option, current-JPEG renderer, or video transcode. Stable `assetId` and `fileId` values identify logical records. `sourceRevision` describes the asset snapshot and per-file `contentRevision` changes only when that logical representation's bytes change.
+
+One v2 job contains between 1 and 100,000 assets. A larger frozen selection must be split into multiple freshly planned jobs; neither client nor receiver may emit or accept an oversized manifest as one job.
+
+### File roles and relationships
+
+The canonical v2 enum values are:
+
+- `storageArea`: `master`, `libraryData`
+- `roles`: `masterCurrent`, `rootOriginal`, `currentLiveMotion`, `originalLiveMotion`, `adjustmentBase`, `adjustmentRecipe`, `alternateOriginal`, `auxiliary`
+- `criticality`: `masterRequired`, `archiveRequired`, `optional`
+- `provenance`: `exactPhotoKitResource`, `generatedThumbnail`
+- `availability`: `available`, `sourceUnavailable`, `transferFailed`, `missing`, `tampered`, `superseded`
+- `mediaSubtypes`: `panorama`, `screenshot`, `livePhoto`, `depthEffect`, `raw`, `hdr`, `slowMotion`, `highFrameRate`, `timelapse`, `cinematic`, `screenRecording`, `spatialMedia`
+
+Every `ExportFile` carries those fields plus the PhotoKit string type and raw integer, original filename, UTI/MIME, dimensions or duration, byte count, digest, capture date, proposed path, and content revision. Generated thumbnails use null PhotoKit type/raw values, are `optional` `libraryData` `auxiliary` files, and never qualify as archival media. `photoProxy` is excluded. Unknown authoritative future PhotoKit resources use type `unknown`, retain their raw integer, and are support files unless a later protocol defines otherwise.
+
+The canonical proposed thumbnail path is `MB Photos Data/Thumbnails/<asset-id>/<file-id>.jpg`. The per-file component versions replaceable thumbnails without changing the asset identity. As with every proposed path, a receiver may return a collision-adjusted `acceptedRelativePath` instead.
+
+Master selection is deterministic: an unedited photo/video uses its exact `photo`/`video`; an edited photo/video requires exact `fullSizePhoto`/`fullSizeVideo`; a Live Photo uses only the current still (`fullSizePhoto` when edited, otherwise `photo`); and RAW+JPEG/ProRAW uses the primary current still selected by PhotoKit. Untouched roots, paired motion, adjustment resources, and alternate originals are `libraryData`. No absent current resource may be replaced with a generated or lower-quality Master.
+
+`ExportAsset.masterFileId` is required but nullable. A non-null value must reference its single available `masterCurrent` file. A missing required full-size current resource uses a null `masterFileId`, retains an unavailable master file descriptor for reporting, and must not trigger a generated fallback. Unedited media may use one physical file with both `masterCurrent` and `rootOriginal` roles.
+
+`livePhotoRelationships` is null for non-Live assets. For a Live Photo it contains required, individually nullable `currentStillFileId`, `currentMotionFileId`, `originalStillFileId`, and `originalMotionFileId`. Every non-null ID must reference a file in the same asset with the matching role. Live motion is always `libraryData`; only the current still can be the Master representation.
+
+### Destination and catalog layout
+
+All paths are relative to one movable library root:
+
+```text
+Master/<year>/<year-month>/<date>/<media>
+MB Photos Data/library.json
+MB Photos Data/Resources/<asset-id>/<file-id>.<extension>
+MB Photos Data/Thumbnails/<asset-id>/<file-id>.jpg
+MB Photos Data/Catalog/current.json
+MB Photos Data/Catalog/generations/<generation-id>/assets.jsonl
+MB Photos Data/Catalog/generations/<generation-id>/albums.jsonl
+MB Photos Data/Reports/<job-id>.json
+MB Photos Data/.mbphotos/
+```
+
+`Master/` contains media only: one active current file per successfully synced asset, with no Live motion, adjustments, thumbnails, manifests, or receiver state. `storageArea: master` paths must begin `Master/`; `storageArea: libraryData` paths must begin `MB Photos Data/`. Path policy v2 otherwise retains the v1 sanitization and 239 UTF-16-unit rules.
+
+`MB Photos Data/library.json` has exactly these descriptor fields: `libraryFormatVersion`, `destinationId`, `createdAt`, `masterRelativePath`, `dataRelativePath`, and `catalogPointerRelativePath`. The three paths are the constants `Master`, `MB Photos Data`, and `MB Photos Data/Catalog/current.json`.
+
+`current.json` has `catalogFormatVersion`, `generationId`, `generatedAt`, `assetsRelativePath`, and `albumsRelativePath`. Each `assets.jsonl` line is a `CatalogAsset` with the active nullable Master reference, Live relationships, `archiveState`, and `CatalogFile` records. Catalog files use receiver-authoritative `acceptedRelativePath` rather than a proposal and explicitly retain availability. An `available` catalog file must have a path, byte count, and SHA-256. Each `albums.jsonl` line is a `CatalogAlbumMembership`.
+
+### Promotion and failures
+
+The receiver stages uploaded bytes under its private state, verifies byte count and SHA-256, and stores support resources before changing Master. A successful file `commit` receipt means its bytes are durably verified at the receiver and its target relative path is reserved; it does not by itself mean a replacement Master is published. Before promotion the receiver re-hashes any prior cataloged Master whose destination metadata changed. A missing, renamed, or modified prior Master produces `master_conflict`; the receiver never moves or overwrites that external change.
+
+Master promotion and the catalog-generation pointer are journaled and recoverable. A `masterRequired` failure preserves the prior Master and does not publish an inaccurate fallback. An `archiveRequired` failure may still promote the exact current Master, but the catalog marks the asset `incomplete` and the dependent original/Live export remains unavailable. An `optional` failure, such as a replaceable thumbnail failure, does not by itself make the archive incomplete. Source deletion or lost Photos permission never authorizes receiver deletion.
+
+The v2 chunk size, inclusive `Content-Range`, chunk digest, retry, and identifier idempotency rules are unchanged from v1. Completion reports replace the old manifest list with `catalogGeneration`, whose paths identify the immutable asset/album generation and `current.json` pointer.
+
+## Protocol v1 (frozen reference)
 
 ## Pairing and authentication
 

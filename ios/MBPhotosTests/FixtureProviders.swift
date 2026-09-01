@@ -26,11 +26,11 @@ final class FixturePhotoCatalog: PhotoCatalogProviding {
     func presentLimitedLibraryPicker(from viewController: UIViewController) {}
 }
 
-actor FixtureOriginalProvider: OriginalRenditionProviding {
+actor FixtureOriginalProvider: PhotoResourceMaterializing {
     let bytes: Data
     init(bytes: Data) { self.bytes = bytes }
 
-    func materializeOriginal(
+    func materializeResource(
         assetID: String,
         descriptor: PhotoResourceDescriptor,
         to outputURL: URL,
@@ -42,14 +42,13 @@ actor FixtureOriginalProvider: OriginalRenditionProviding {
     }
 }
 
-actor FixtureJPEGRenderer: CurrentJPEGRendering {
+actor FixtureJPEGRenderer: ThumbnailRendering {
     let bytes: Data
     init(bytes: Data) { self.bytes = bytes }
 
-    func renderCurrentJPEG(
+    func renderThumbnail(
         assetID: String,
         to outputURL: URL,
-        preserveLocation: Bool,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws {
         try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)

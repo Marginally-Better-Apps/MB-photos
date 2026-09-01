@@ -13,7 +13,7 @@ enum PairingPayloadError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .malformed: "This is not an MB Photos receiver QR code."
-        case .unsupportedVersion: "The Windows receiver uses an unsupported protocol version."
+        case .unsupportedVersion: "This receiver uses the previous backup format. Leave that destination untouched and create a fresh Portable Master Library with the current Windows app."
         case .nonPrivateAddress: "The receiver must use a private local-network IPv4 address."
         case .invalidPort: "The receiver advertised an invalid network port."
         case .invalidToken: "The one-time pairing code is invalid. Start the receiver again."
@@ -110,9 +110,12 @@ struct ReceiverCapabilities: Codable, Equatable, Sendable {
     let chunkSizeBytes: Int
     let maxRelativePathUtf16Units: Int
     let pathPolicyVersion: Int
+    let destinationFormatVersion: Int
+    let catalogFormatVersion: Int
     let hashAlgorithm: String
     let sequentialChunksRequired: Bool
     let supportedProfiles: [ExportProfileKind]
+    let supportedStorageAreas: [StorageArea]
 }
 
 struct PairResponse: Codable, Sendable {
@@ -141,6 +144,8 @@ enum FileDecisionReason: String, Codable, Sendable {
     case partial
     case changed
     case pathAdjusted
+    case sourceUnavailable
+    case masterConflict
     case unresolvableConflict
 }
 
@@ -278,6 +283,7 @@ enum AbandonReason: String, Codable, Sendable {
     case userDiscarded
     case sourceUnavailable
     case clientReset
+    case protocolUpgradeRequired
 }
 
 struct AbandonJobRequest: Codable, Sendable {
@@ -430,7 +436,7 @@ actor TransferClient {
                 instanceId: instanceID
             )
         )
-        let response: PairResponse = try await sendJSON(path: "/v1/pair", method: "POST", body: body, authenticated: false)
+        let response: PairResponse = try await sendJSON(path: "/v2/pair", method: "POST", body: body, authenticated: false)
         guard response.protocolVersion == ExportConstants.protocolVersion else {
             throw TransferError.incompatibleReceiver("protocol version")
         }
@@ -438,23 +444,41 @@ actor TransferClient {
         guard capabilities.chunkSizeBytes == ExportConstants.chunkSize,
               capabilities.maxRelativePathUtf16Units == ExportConstants.maximumRelativePathLength,
               capabilities.pathPolicyVersion == ExportConstants.pathPolicyVersion,
+              capabilities.destinationFormatVersion == ExportConstants.destinationFormatVersion,
+              capabilities.catalogFormatVersion == ExportConstants.catalogFormatVersion,
               capabilities.hashAlgorithm == "sha256",
-              capabilities.sequentialChunksRequired
+              capabilities.sequentialChunksRequired,
+              capabilities.supportedProfiles.contains(.portableLibrary),
+              Set(capabilities.supportedStorageAreas) == Set([.master, .libraryData]),
+              response.destination.pathPolicyVersion == ExportConstants.pathPolicyVersion,
+              response.destination.destinationFormatVersion == ExportConstants.destinationFormatVersion
         else { throw TransferError.incompatibleReceiver("transfer or path capabilities") }
         bearerToken = response.sessionToken
         return response
     }
 
     func createOrReconcileJob(_ job: ExportJob) async throws -> JobPlan {
-        let plan: JobPlan = try await sendJSON(path: "/v1/jobs", method: "POST", body: job)
-        guard plan.protocolVersion == ExportConstants.protocolVersion, plan.jobId == job.jobId else {
+        let plan: JobPlan = try await sendJSON(path: "/v2/jobs", method: "POST", body: job)
+        guard plan.protocolVersion == ExportConstants.protocolVersion,
+              plan.jobId == job.jobId,
+              Self.isCurrentFormat(plan.destination) else {
             throw TransferError.invalidResponse
         }
         return plan
     }
 
     func jobStatus(jobID: UUID) async throws -> JobStatusResponse {
-        try await send(path: "/v1/jobs/\(jobID.uuidString.lowercased())", method: "GET", body: nil)
+        let status: JobStatusResponse = try await send(
+            path: "/v2/jobs/\(jobID.uuidString.lowercased())",
+            method: "GET",
+            body: nil
+        )
+        guard status.protocolVersion == ExportConstants.protocolVersion,
+              status.jobId == jobID,
+              Self.isCurrentFormat(status.destination) else {
+            throw TransferError.invalidResponse
+        }
+        return status
     }
 
     func uploadFile(
@@ -482,7 +506,7 @@ actor TransferClient {
             guard !data.isEmpty else { throw TransferError.invalidResponse }
             let chunkHash = SHA256.hash(data: data).hexString
             var request = try makeRequest(
-                path: "/v1/jobs/\(jobID.uuidString.lowercased())/files/\(fileID.uuidString.lowercased())/chunks/\(index)",
+                path: "/v2/jobs/\(jobID.uuidString.lowercased())/files/\(fileID.uuidString.lowercased())/chunks/\(index)",
                 method: "PUT",
                 authenticated: true
             )
@@ -512,14 +536,15 @@ actor TransferClient {
     func commitFile(jobID: UUID, fileID: UUID, digest: FileDigest) async throws -> FileCommitReceipt {
         let body = CommitFileRequest(byteCount: digest.byteCount, sha256: digest.sha256)
         let receipt: FileCommitReceipt = try await sendJSON(
-            path: "/v1/jobs/\(jobID.uuidString.lowercased())/files/\(fileID.uuidString.lowercased())/commit",
+            path: "/v2/jobs/\(jobID.uuidString.lowercased())/files/\(fileID.uuidString.lowercased())/commit",
             method: "POST",
             body: body
         )
         guard receipt.fileId == fileID,
               receipt.state == "committed",
               receipt.byteCount == digest.byteCount,
-              receipt.sha256 == digest.sha256
+              receipt.sha256 == digest.sha256,
+              WindowsPathSanitizer.validateRelativePath(receipt.relativePath)
         else { throw TransferError.receiptMismatch }
         return receipt
     }
@@ -529,16 +554,22 @@ actor TransferClient {
         failures: [CompletionFailure] = [],
         at date: Date = Date()
     ) async throws -> CompletionReport {
-        try await sendJSON(
-            path: "/v1/jobs/\(jobID.uuidString.lowercased())/complete",
+        let report: CompletionReport = try await sendJSON(
+            path: "/v2/jobs/\(jobID.uuidString.lowercased())/complete",
             method: "POST",
             body: CompleteJobRequest(completedAt: date, failures: failures)
         )
+        guard report.protocolVersion == ExportConstants.protocolVersion,
+              report.jobId == jobID,
+              report.state == .completed || report.state == .completedWithFailures else {
+            throw TransferError.invalidResponse
+        }
+        return report
     }
 
     func abandonJob(jobID: UUID, reason: AbandonReason) async throws -> AbandonmentReceipt {
         try await sendJSON(
-            path: "/v1/jobs/\(jobID.uuidString.lowercased())/abandon",
+            path: "/v2/jobs/\(jobID.uuidString.lowercased())/abandon",
             method: "POST",
             body: AbandonJobRequest(reason: reason)
         )
@@ -580,6 +611,11 @@ actor TransferClient {
             request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
         }
         return request
+    }
+
+    private static func isCurrentFormat(_ destination: Destination) -> Bool {
+        destination.pathPolicyVersion == ExportConstants.pathPolicyVersion
+            && destination.destinationFormatVersion == ExportConstants.destinationFormatVersion
     }
 
     private func perform<Response: Decodable>(_ request: URLRequest, body: Data?) async throws -> Response {

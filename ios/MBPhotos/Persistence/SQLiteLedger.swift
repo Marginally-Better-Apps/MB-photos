@@ -110,6 +110,7 @@ enum ReviewQueuePersistenceMutation: Sendable {
 enum LedgerError: LocalizedError {
     case open(String)
     case corruptJob(UUID)
+    case legacyJobRequiresReplanning(UUID)
     case corruptOrganizeRecord(String)
     case invalidDeletionBatch(String)
 
@@ -117,6 +118,8 @@ enum LedgerError: LocalizedError {
         switch self {
         case let .open(message): "Could not open export history: \(message)"
         case let .corruptJob(id): "Saved export \(id.uuidString) is unreadable."
+        case .legacyJobRequiresReplanning:
+            "This paused transfer uses the previous backup format. Leave it untouched and create a fresh Portable Master Library transfer."
         case let .corruptOrganizeRecord(identifier):
             "Saved Organize record \(identifier) is unreadable."
         case let .invalidDeletionBatch(message): message
@@ -505,7 +508,13 @@ actor SQLiteLedger: PhotoLibraryIndexPersisting {
                 arguments: [Self.id(id)]
             )
         }
-        guard let storedData, let job = try? decoder.decode(ExportJob.self, from: storedData) else {
+        guard let storedData else { throw LedgerError.corruptJob(id) }
+        if let object = try? JSONSerialization.jsonObject(with: storedData) as? [String: Any],
+           let version = object["protocolVersion"] as? Int,
+           version != ExportConstants.protocolVersion {
+            throw LedgerError.legacyJobRequiresReplanning(id)
+        }
+        guard let job = try? decoder.decode(ExportJob.self, from: storedData) else {
             throw LedgerError.corruptJob(id)
         }
         return job

@@ -1,0 +1,11 @@
+{
+  "completedAt": "2026-08-31T15:17:53Z",
+  "failures": [
+    {
+      "fileId": "99999999-9999-4999-8999-999999999999",
+      "code": "unavailable_source",
+      "message": "The adjustment resource could not be downloaded from iCloud.",
+      "retryable": true
+    }
+  ]
+}

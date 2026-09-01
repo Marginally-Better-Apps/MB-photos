@@ -1,0 +1,11 @@
+{
+  "jobId": "11111111-1111-4111-8111-111111111111",
+  "fileId": "33333333-3333-4333-8333-333333333333",
+  "chunkIndex": 0,
+  "startOffset": 0,
+  "endOffsetExclusive": 8388608,
+  "byteCount": 8388608,
+  "chunkSha256": "abababababababababababababababababababababababababababababababab",
+  "nextChunkIndex": 1,
+  "receivedAt": "2026-08-31T15:03:34Z"
+}

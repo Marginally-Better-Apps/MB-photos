@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using MBPhotos.Receiver.Diagnostics;
 using MBPhotos.Receiver.Hosting;
+using MBPhotos.Receiver.Library;
 using MBPhotos.Receiver.Models;
 using MBPhotos.Receiver.Pairing;
 using MBPhotos.Receiver.Storage;
@@ -29,6 +30,7 @@ internal static class Program
         {
             ("shared Windows path vectors", TestPathVectorsAsync),
             ("shared protocol fixtures", TestProtocolFixturesAsync),
+            ("v2 manifest semantic invariants", TestV2ManifestSemanticsAsync),
             ("pair token expiry, replay, and session auth", TestPairingAsync),
             ("destination initialization and schema migration", TestDestinationAndLedgerAsync),
             ("v2 ledger migration backfills chunk cursors and progress counters", TestLedgerV2MigrationAsync),
@@ -59,6 +61,13 @@ internal static class Program
             ("diagnostics logging is background, bounded, and flushed", TestBackgroundDiagnosticsAsync),
             ("100,000-asset finalization streams bounded metadata", TestHundredThousandAssetFinalizationAsync),
             ("completed ledger history streams in bounded ordered batches", TestCompletedLedgerStreamingAsync),
+            ("portable Master transitions reuse originals and export exact variants", TestPortableTransitionsAndExportsAsync),
+            ("current Live motion revisions clean superseded receiver files", TestLiveMotionRevisionCleanupAsync),
+            ("Master conflicts are per-asset failures and preserve prior catalog", TestMasterConflictPreservesPriorAsync),
+            ("terminal status republishes a missing catalog pointer", TestTerminalCatalogRecoveryAsync),
+            ("activated Master retry completes without staged bytes", TestActivatedPromotionRetryAsync),
+            ("unavailable Master placeholders plan a source conflict", TestUnavailableMasterPlaceholderAsync),
+            ("version 1 destinations are rejected untouched", TestV1DestinationRejectedAsync),
         };
 
         foreach (var test in tests)
@@ -166,6 +175,21 @@ internal static class Program
             }
         }
 
+        var thumbnailAssetId = Guid.NewGuid();
+        var thumbnailFileId = Guid.NewGuid();
+        var overlongThumbnail = "MB Photos Data/Thumbnails/" +
+            string.Join('/', Enumerable.Repeat(new string('x', 200), 2)) + "/thumb.jpg";
+        Equal(
+            $"MB Photos Data/Thumbnails/{thumbnailAssetId:D}/{thumbnailFileId:D}.jpg",
+            policy.NormalizeProposedPath(
+                overlongThumbnail,
+                null,
+                "thumb.jpg",
+                thumbnailFileId,
+                StorageArea.LibraryData,
+                thumbnailAssetId,
+                Provenance.GeneratedThumbnail));
+
         return Task.CompletedTask;
     }
 
@@ -178,7 +202,7 @@ internal static class Program
         Equal(ProtocolConstants.Version, pair.ProtocolVersion);
         var job = Fixture<ExportJob>(fixtures, "create-job.request.json");
         ModelValidation.Validate(job);
-        Equal(4, job.Assets.Sum(static asset => asset.Files.Count));
+        Equal(5, job.Assets.Sum(static asset => asset.Files.Count));
         var plan = Fixture<JobPlan>(fixtures, "create-job.response.json");
         Equal(JobFileAction.Resume, plan.Decisions[0].Action);
         var status = Fixture<JobStatus>(fixtures, "job-status.response.json");
@@ -191,12 +215,20 @@ internal static class Program
         var failedCompletion = Fixture<CompleteJobRequest>(fixtures, "complete-job-with-failures.request.json");
         Equal(1, failedCompletion.Failures?.Count);
         var report = Fixture<CompletionReport>(fixtures, "completion-report.response.json");
-        Equal(3, report.Counts.VerifiedOriginalFiles);
+        Equal(2, report.Counts.AssetsPromoted);
         var failedReport = Fixture<CompletionReport>(fixtures, "completion-report-with-failures.response.json");
         Equal("completedWithFailures", failedReport.State);
         _ = Fixture<AbandonJobRequest>(fixtures, "abandon-job.request.json");
         _ = Fixture<AbandonJobResponse>(fixtures, "abandon-job.response.json");
         _ = Fixture<ApiError>(fixtures, "api-error.response.json");
+        var scenarios = Fixture<ExportJob>(fixtures, "scenario-matrix.request.json");
+        ModelValidation.Validate(scenarios);
+        Equal(6, scenarios.Assets.Count);
+        _ = Fixture<LibraryDescriptor>(fixtures, "library.json");
+        _ = Fixture<CatalogPointer>(fixtures, "catalog-current.json");
+        _ = Fixture<CatalogAsset>(fixtures, "catalog-asset.json");
+        _ = Fixture<CatalogAlbumMembership>(fixtures, "catalog-album.json");
+        Equal(1024L * 1024 * 1024, ReceiverServer.MaximumJobManifestBytes);
         var emptyAbandon = JsonSerializer.Serialize(new AbandonJobRequest(null), JsonOptions);
         True(!emptyAbandon.Contains("reason", StringComparison.Ordinal));
         return Task.CompletedTask;
@@ -206,6 +238,61 @@ internal static class Program
     {
         var value = JsonSerializer.Deserialize<T>(File.ReadAllText(Path.Combine(fixtures, name)), JsonOptions);
         return value ?? throw new InvalidDataException($"Fixture {name} decoded as null.");
+    }
+
+    private static Task TestV2ManifestSemanticsAsync()
+    {
+        var bytes = Encoding.UTF8.GetBytes("semantic validation");
+        var baseline = Job(bytes, new StableIds(), Guid.NewGuid(), new string('a', 64));
+        var asset = baseline.Assets.Single();
+        var file = asset.Files.Single();
+
+        Equal(ErrorCodes.InvalidRequest, Throws<ReceiverApiException>(() =>
+            ModelValidation.Validate(baseline with { SourceTimeZone = new string('x', 65) })).Error.Code);
+        Equal(ErrorCodes.InvalidRequest, Throws<ReceiverApiException>(() =>
+            ModelValidation.Validate(baseline with
+            {
+                Assets = new[] { asset with { Files = new[] { file with { PhotoKitResourceTypeRaw = null } } } },
+            })).Error.Code);
+        Equal(ErrorCodes.InvalidRequest, Throws<ReceiverApiException>(() =>
+            ModelValidation.Validate(baseline with
+            {
+                Assets = new[]
+                {
+                    asset with
+                    {
+                        Files = new[]
+                        {
+                            file with
+                            {
+                                Roles = new[] { RepresentationRole.MasterCurrent, RepresentationRole.AdjustmentRecipe },
+                            },
+                        },
+                    },
+                },
+            })).Error.Code);
+        Equal(ErrorCodes.InvalidRequest, Throws<ReceiverApiException>(() =>
+            ModelValidation.Validate(baseline with
+            {
+                Assets = new[] { asset with { MediaSubtypes = new[] { "livePhoto" } } },
+            })).Error.Code);
+        Equal(ErrorCodes.InvalidRequest, Throws<ReceiverApiException>(() =>
+            ModelValidation.Validate(baseline with
+            {
+                Assets = new[]
+                {
+                    asset with
+                    {
+                        MasterFileId = null,
+                        Files = new[]
+                        {
+                            file with { Availability = Availability.SourceUnavailable, Sha256 = Sha(bytes) },
+                        },
+                    },
+                },
+            })).Error.Code);
+
+        return Task.CompletedTask;
     }
 
     private static Task TestPairingAsync()
@@ -650,7 +737,7 @@ internal static class Program
     private static async Task TestHundredThousandAssetFinalizationAsync()
     {
         const int assetCount = 100_000;
-        const long maximumManagedBytes = 1_500L * 1024 * 1024;
+        const long maximumManagedBytes = 3_000L * 1024 * 1024;
         var elapsed = System.Diagnostics.Stopwatch.StartNew();
         long maximumManaged = GC.GetTotalMemory(false);
         using var monitorCancellation = new CancellationTokenSource();
@@ -683,7 +770,7 @@ internal static class Program
             Equal(assetCount, report.Counts.FilesCommitted);
             Equal(0, report.Counts.FilesFailed);
 
-            var reportPath = Path.Combine(context.Root, "Reports", jobId.ToString("D") + ".json");
+            var reportPath = Path.Combine(context.Destination.ReportsPath, jobId.ToString("D") + ".json");
             True(new FileInfo(reportPath).Length < 64 * 1024,
                 "the completion report unexpectedly materialized asset history");
             await using (var reportStream = new FileStream(
@@ -700,12 +787,14 @@ internal static class Program
                 Equal(assetCount, streamedReport?.Counts.FilesCommitted ?? -1);
             }
 
-            var assetsPath = Path.Combine(context.Root, "Metadata", "assets.jsonl");
+            var pointer = JsonSerializer.Deserialize<CatalogPointer>(
+                await File.ReadAllTextAsync(Path.Combine(context.Destination.CatalogPath, "current.json")), JsonOptions)!;
+            var assetsPath = context.PathPolicy.ResolveUnderRoot(context.Root, pointer.AssetsRelativePath);
             Equal((long)assetCount, await CountLinesAsync(assetsPath));
             True(new FileInfo(assetsPath).Length > assetCount,
                 "the asset manifest was not populated");
             True(!Directory.EnumerateFiles(
-                    Path.Combine(context.Root, "Photos"),
+                    context.Destination.MasterPath,
                     "*",
                     SearchOption.AllDirectories).Any(),
                 "the metadata stress test must not create payload files");
@@ -735,12 +824,21 @@ internal static class Program
         var template = Job(Array.Empty<byte>(), ids, Guid.NewGuid(), new string('b', 64));
         var templateAsset = template.Assets.Single();
         var files = Enumerable.Range(0, 17)
-            .Select(index => templateAsset.Files.Single() with
-            {
-                FileId = Guid.NewGuid(),
-                OriginalFilename = $"stream-{index:D2}.jpg",
-                ProposedRelativePath = $"Photos/stream/{index:D2}.jpg",
-            })
+            .Select(index => index == 0
+                ? templateAsset.Files.Single() with
+                {
+                    OriginalFilename = $"stream-{index:D2}.jpg",
+                    ProposedRelativePath = $"Master/stream/{index:D2}.jpg",
+                }
+                : templateAsset.Files.Single() with
+                {
+                    FileId = Guid.NewGuid(),
+                    StorageArea = StorageArea.LibraryData,
+                    Roles = new[] { RepresentationRole.Auxiliary },
+                    Criticality = Criticality.Optional,
+                    OriginalFilename = $"stream-{index:D2}.jpg",
+                    ProposedRelativePath = $"MB Photos Data/Resources/{templateAsset.AssetId:D}/stream-{index:D2}.jpg",
+                })
             .ToArray();
         var job = template with { Assets = new[] { templateAsset with { Files = files } } };
         await context.Coordinator.CreateJobAsync(job);
@@ -777,6 +875,350 @@ internal static class Program
         True(maximumBatch <= 3, "the completed ledger snapshot exceeded its requested batch bound");
         True(files.Select(static file => file.FileId).SequenceEqual(streamedFiles),
             "the completed ledger snapshot did not preserve frozen file order");
+    }
+
+    private static async Task TestPortableTransitionsAndExportsAsync()
+    {
+        await using var context = await TestContext.CreateAsync();
+        var assetId = Guid.NewGuid();
+        var originalId = Guid.NewGuid();
+        var editedId = Guid.NewGuid();
+        var originalBytes = Encoding.UTF8.GetBytes("untouched original bytes");
+        var editedBytes = Encoding.UTF8.GetBytes("full-size edited bytes");
+        const string masterPath = "Master/2026/2026-08/2026-08-24/photo.jpg";
+        var resourcePath = $"MB Photos Data/Resources/{assetId:D}/{originalId:D}.jpg";
+
+        var originalMaster = PortableFile(
+            originalId,
+            assetId,
+            new string('1', 64),
+            StorageArea.Master,
+            new[] { RepresentationRole.MasterCurrent, RepresentationRole.RootOriginal },
+            Criticality.MasterRequired,
+            "photo.jpg",
+            masterPath,
+            originalBytes);
+        var first = PortableJob(assetId, new string('a', 64), false, new[] { originalMaster }, originalId);
+        await context.Coordinator.CreateJobAsync(first);
+        await UploadAndCommitAsync(context, first, originalId, originalBytes);
+        await context.Coordinator.CompleteAsync(first.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
+
+        var archivedOriginal = originalMaster with
+        {
+            StorageArea = StorageArea.LibraryData,
+            Roles = new[] { RepresentationRole.RootOriginal },
+            Criticality = Criticality.ArchiveRequired,
+            ProposedRelativePath = resourcePath,
+        };
+        var editedMaster = PortableFile(
+            editedId,
+            assetId,
+            new string('2', 64),
+            StorageArea.Master,
+            new[] { RepresentationRole.MasterCurrent },
+            Criticality.MasterRequired,
+            "photo.jpg",
+            masterPath,
+            editedBytes,
+            "fullSizePhoto");
+        var second = PortableJob(
+            assetId,
+            new string('b', 64),
+            true,
+            new[] { archivedOriginal, editedMaster },
+            editedId);
+        var secondPlan = await context.Coordinator.CreateJobAsync(second);
+        Equal(JobFileAction.Skip, secondPlan.Decisions.Single(decision => decision.FileId == originalId).Action);
+        Equal(JobFileAction.Upload, secondPlan.Decisions.Single(decision => decision.FileId == editedId).Action);
+        await UploadAndCommitAsync(context, second, editedId, editedBytes);
+        await context.Coordinator.CompleteAsync(second.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
+
+        var masters = Directory.EnumerateFiles(context.Destination.MasterPath, "*", SearchOption.AllDirectories).ToArray();
+        Equal(1, masters.Length);
+        Equal(Sha(editedBytes), await Hashing.Sha256FileAsync(masters[0]));
+        var archivedPath = context.PathPolicy.ResolveUnderRoot(context.Root, resourcePath);
+        Equal(Sha(originalBytes), await Hashing.Sha256FileAsync(archivedPath));
+
+        var library = await new PortableLibraryService().OpenAsync(context.Root);
+        var libraryAsset = library.Assets.Single(asset => asset.AssetId == assetId);
+        True(libraryAsset.AvailableVariants.Contains(VariantKind.CurrentMaster));
+        True(libraryAsset.AvailableVariants.Contains(VariantKind.RootOriginal));
+        var exportDirectory = TempDirectory();
+        try
+        {
+            var exporter = new VariantExportService();
+            var exported = await exporter.ExportAsync(library, assetId, VariantKind.RootOriginal, exportDirectory);
+            Equal(Sha(originalBytes), exported.Sha256);
+            Equal(Sha(originalBytes), await Hashing.Sha256FileAsync(exported.ExportedPath));
+            var rootVariant = libraryAsset.Files.Single(file => file.Catalog.Roles.Contains(RepresentationRole.RootOriginal));
+            await ThrowsAsync<InvalidOperationException>(() =>
+                exporter.ExportAsync(rootVariant, context.Destination.MasterPath));
+
+            var linkedExportRoot = TempDirectory();
+            var linkedIntoLibrary = Path.Combine(linkedExportRoot, "linked-master");
+            try
+            {
+                Directory.CreateSymbolicLink(linkedIntoLibrary, context.Destination.MasterPath);
+                await ThrowsAsync<InvalidOperationException>(() =>
+                    exporter.ExportAsync(rootVariant, linkedIntoLibrary));
+            }
+            finally
+            {
+                if (Directory.Exists(linkedIntoLibrary) || File.Exists(linkedIntoLibrary))
+                {
+                    Directory.Delete(linkedIntoLibrary);
+                }
+                Directory.Delete(linkedExportRoot, true);
+            }
+        }
+        finally
+        {
+            Directory.Delete(exportDirectory, true);
+        }
+
+        var revertedMaster = originalMaster with { ProposedRelativePath = masterPath };
+        var conflictedRevert = PortableJob(assetId, new string('c', 64), false, new[] { revertedMaster }, originalId);
+        var conflictedPlan = await context.Coordinator.CreateJobAsync(conflictedRevert);
+        Equal(JobFileAction.Skip, conflictedPlan.Decisions.Single().Action);
+        var acceptedRevertPath = conflictedPlan.Decisions.Single().AcceptedRelativePath!;
+        var occupiedRevertPath = context.PathPolicy.ResolveUnderRoot(context.Root, acceptedRevertPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(occupiedRevertPath)!);
+        var unrelatedBytes = Encoding.UTF8.GetBytes("unrelated external collision");
+        await File.WriteAllBytesAsync(occupiedRevertPath, unrelatedBytes);
+        var conflictReport = await context.Coordinator.CompleteAsync(
+            conflictedRevert.JobId,
+            new CompleteJobRequest(DateTimeOffset.UtcNow));
+        Equal("completedWithFailures", conflictReport.State);
+        Equal(ErrorCodes.MasterConflict, conflictReport.Failures.Single().Code);
+        Equal(Sha(unrelatedBytes), await Hashing.Sha256FileAsync(occupiedRevertPath));
+        Equal(Sha(originalBytes), await Hashing.Sha256FileAsync(archivedPath));
+        masters = Directory.EnumerateFiles(context.Destination.MasterPath, "*", SearchOption.AllDirectories).ToArray();
+        True(masters.Any(path => Hashing.Sha256FileAsync(path).GetAwaiter().GetResult() == Sha(editedBytes)));
+
+        File.Delete(occupiedRevertPath);
+        var successfulRevert = PortableJob(assetId, new string('d', 64), false, new[] { revertedMaster }, originalId);
+        var successfulPlan = await context.Coordinator.CreateJobAsync(successfulRevert);
+        Equal(JobFileAction.Skip, successfulPlan.Decisions.Single().Action);
+        await context.Coordinator.CompleteAsync(successfulRevert.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
+
+        masters = Directory.EnumerateFiles(context.Destination.MasterPath, "*", SearchOption.AllDirectories).ToArray();
+        Equal(1, masters.Length);
+        Equal(Sha(originalBytes), await Hashing.Sha256FileAsync(masters[0]));
+        True(!File.Exists(archivedPath),
+            "the verified Resources duplicate should be removed only after successful Master activation and catalog publish");
+    }
+
+    private static async Task TestLiveMotionRevisionCleanupAsync()
+    {
+        await using var context = await TestContext.CreateAsync();
+        var assetId = Guid.NewGuid();
+        var masterId = Guid.NewGuid();
+        var motionId = Guid.NewGuid();
+        var masterBytes = Encoding.UTF8.GetBytes("stable live still");
+        var masterPath = "Master/2026/2026-08/2026-08-24/live.jpg";
+        var motionPath = $"MB Photos Data/Resources/{assetId:D}/current.mov";
+
+        async Task SyncAsync(char revision, byte[] motionBytes, bool first)
+        {
+            var master = PortableFile(
+                masterId,
+                assetId,
+                new string('4', 64),
+                StorageArea.Master,
+                new[] { RepresentationRole.MasterCurrent, RepresentationRole.RootOriginal },
+                Criticality.MasterRequired,
+                "live.jpg",
+                masterPath,
+                masterBytes);
+            var motion = PortableFile(
+                motionId,
+                assetId,
+                new string(revision, 64),
+                StorageArea.LibraryData,
+                new[] { RepresentationRole.CurrentLiveMotion },
+                Criticality.ArchiveRequired,
+                "live.mov",
+                motionPath,
+                motionBytes,
+                "fullSizePairedVideo",
+                "video/quicktime");
+            var job = PortableJob(
+                assetId,
+                new string(revision, 64),
+                true,
+                new[] { master, motion },
+                masterId,
+                new LivePhotoRelationships(masterId, motionId, masterId, null));
+            var plan = await context.Coordinator.CreateJobAsync(job);
+            if (first)
+            {
+                await UploadAndCommitAsync(context, job, masterId, masterBytes);
+            }
+            else
+            {
+                Equal(JobFileAction.Skip, plan.Decisions.Single(decision => decision.FileId == masterId).Action);
+            }
+            Equal(JobFileAction.Upload, plan.Decisions.Single(decision => decision.FileId == motionId).Action);
+            await UploadAndCommitAsync(context, job, motionId, motionBytes);
+            await context.Coordinator.CompleteAsync(job.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
+            var motions = Directory.EnumerateFiles(context.Destination.ResourcesPath, "*.mov", SearchOption.AllDirectories).ToArray();
+            Equal(1, motions.Length);
+            Equal(Sha(motionBytes), await Hashing.Sha256FileAsync(motions[0]));
+        }
+
+        await SyncAsync('5', Encoding.UTF8.GetBytes("motion edit one"), true);
+        await SyncAsync('6', Encoding.UTF8.GetBytes("motion edit two"), false);
+        await SyncAsync('7', Encoding.UTF8.GetBytes("motion edit three"), false);
+    }
+
+    private static async Task TestMasterConflictPreservesPriorAsync()
+    {
+        await using var context = await TestContext.CreateAsync();
+        var assetId = Guid.NewGuid();
+        var originalId = Guid.NewGuid();
+        var originalBytes = Encoding.UTF8.GetBytes("cataloged Master");
+        var masterPath = "Master/2026/2026-08/2026-08-24/conflict.jpg";
+        var original = PortableFile(
+            originalId,
+            assetId,
+            new string('8', 64),
+            StorageArea.Master,
+            new[] { RepresentationRole.MasterCurrent, RepresentationRole.RootOriginal },
+            Criticality.MasterRequired,
+            "conflict.jpg",
+            masterPath,
+            originalBytes);
+        var first = PortableJob(assetId, new string('8', 64), false, new[] { original }, originalId);
+        await context.Coordinator.CreateJobAsync(first);
+        await UploadAndCommitAsync(context, first, originalId, originalBytes);
+        await context.Coordinator.CompleteAsync(first.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
+
+        var physicalMaster = Directory.EnumerateFiles(context.Destination.MasterPath, "*", SearchOption.AllDirectories).Single();
+        var externalBytes = Encoding.UTF8.GetBytes("user changed this outside the app");
+        await File.WriteAllBytesAsync(physicalMaster, externalBytes);
+
+        var editedId = Guid.NewGuid();
+        var editedBytes = Encoding.UTF8.GetBytes("new phone edit");
+        var edited = PortableFile(
+            editedId,
+            assetId,
+            new string('9', 64),
+            StorageArea.Master,
+            new[] { RepresentationRole.MasterCurrent },
+            Criticality.MasterRequired,
+            "conflict.jpg",
+            masterPath,
+            editedBytes,
+            "fullSizePhoto");
+        var second = PortableJob(assetId, new string('9', 64), true, new[] { edited }, editedId);
+        await context.Coordinator.CreateJobAsync(second);
+        await UploadAndCommitAsync(context, second, editedId, editedBytes);
+        var report = await context.Coordinator.CompleteAsync(second.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
+        Equal("completedWithFailures", report.State);
+        Equal(ErrorCodes.MasterConflict, report.Failures.Single().Code);
+        Equal(Sha(externalBytes), await Hashing.Sha256FileAsync(physicalMaster));
+        True(!Directory.EnumerateFiles(context.Destination.MasterPath, "*", SearchOption.AllDirectories)
+            .Any(path => Hashing.Sha256FileAsync(path).GetAwaiter().GetResult() == Sha(editedBytes)));
+        var library = await new PortableLibraryService().OpenAsync(context.Root);
+        Equal(first.Assets.Single().SourceRevision, library.Assets.Single().Catalog.SourceRevision);
+    }
+
+    private static async Task TestTerminalCatalogRecoveryAsync()
+    {
+        await using var context = await TestContext.CreateAsync();
+        var bytes = Encoding.UTF8.GetBytes("catalog recovery");
+        var job = Job(bytes, new StableIds(), Guid.NewGuid(), new string('a', 64));
+        await context.Coordinator.CreateJobAsync(job);
+        await UploadAndCommitAsync(context, job, job.Assets.Single().MasterFileId!.Value, bytes);
+        var report = await context.Coordinator.CompleteAsync(job.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
+        File.Delete(context.PathPolicy.ResolveUnderRoot(context.Root, report.CatalogGeneration.AssetsRelativePath));
+        File.Delete(context.PathPolicy.ResolveUnderRoot(context.Root, report.CatalogGeneration.AlbumsRelativePath));
+        File.Delete(context.PathPolicy.ResolveUnderRoot(context.Root, report.CatalogGeneration.CatalogPointerRelativePath));
+        File.Delete(context.PathPolicy.ResolveUnderRoot(context.Root, report.ReportRelativePath));
+
+        var status = await context.Coordinator.GetStatusAsync(job.JobId);
+        Equal(JobState.Completed, status.State);
+        True(File.Exists(context.PathPolicy.ResolveUnderRoot(context.Root, report.CatalogGeneration.AssetsRelativePath)));
+        True(File.Exists(context.PathPolicy.ResolveUnderRoot(context.Root, report.CatalogGeneration.AlbumsRelativePath)));
+        True(File.Exists(context.PathPolicy.ResolveUnderRoot(context.Root, report.CatalogGeneration.CatalogPointerRelativePath)));
+        True(File.Exists(context.PathPolicy.ResolveUnderRoot(context.Root, report.ReportRelativePath)));
+    }
+
+    private static async Task TestActivatedPromotionRetryAsync()
+    {
+        await using var context = await TestContext.CreateAsync();
+        var bytes = Encoding.UTF8.GetBytes("activated before finalize");
+        var job = Job(bytes, new StableIds(), Guid.NewGuid(), new string('b', 64));
+        await context.Coordinator.CreateJobAsync(job);
+        await UploadAndCommitAsync(context, job, job.Assets.Single().MasterFileId!.Value, bytes);
+        var promotion = new MasterPromotionService(context.Destination, context.Ledger, context.PathPolicy, JsonOptions);
+        var failures = await promotion.PromoteAsync(job, await context.Ledger.GetJobFilesAsync(job.JobId));
+        Equal(0, failures.Count);
+        True(!File.Exists(Partial(context, job.JobId, job.Assets.Single().MasterFileId!.Value)));
+
+        var report = await context.Coordinator.CompleteAsync(job.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
+        Equal("completed", report.State);
+    }
+
+    private static async Task TestUnavailableMasterPlaceholderAsync()
+    {
+        await using var context = await TestContext.CreateAsync();
+        var assetId = Guid.NewGuid();
+        var placeholderId = Guid.NewGuid();
+        var placeholder = PortableFile(
+            placeholderId,
+            assetId,
+            new string('c', 64),
+            StorageArea.Master,
+            new[] { RepresentationRole.MasterCurrent },
+            Criticality.MasterRequired,
+            "missing.heic",
+            "Master/2026/2026-08/2026-08-24/missing.heic",
+            null,
+            "fullSizePhoto",
+            "image/heic",
+            Availability.SourceUnavailable);
+        var job = PortableJob(assetId, new string('c', 64), true, new[] { placeholder }, null);
+        var plan = await context.Coordinator.CreateJobAsync(job);
+        var decision = plan.Decisions.Single();
+        Equal(JobFileAction.Conflict, decision.Action);
+        Equal("sourceUnavailable", decision.Reason);
+        True(decision.AcceptedRelativePath is null);
+        var report = await context.Coordinator.CompleteAsync(
+            job.JobId,
+            new CompleteJobRequest(
+                DateTimeOffset.UtcNow,
+                new[] { new CompletionFailure(placeholderId, ErrorCodes.UnavailableSource, "Missing full-size current resource.", false) }));
+        Equal("completedWithFailures", report.State);
+        Equal(0, report.Counts.AssetsPromoted);
+        Equal(0, report.Counts.AssetsArchiveIncomplete);
+        var library = await new PortableLibraryService().OpenAsync(context.Root);
+        var catalogAsset = library.Assets.Single().Catalog;
+        True(catalogAsset.MasterFileId is null);
+        Equal(ArchiveState.Complete, catalogAsset.ArchiveState);
+        Equal(Availability.SourceUnavailable, catalogAsset.Files.Single().Availability);
+    }
+
+    private static async Task TestV1DestinationRejectedAsync()
+    {
+        var root = TempDirectory();
+        try
+        {
+            var control = Path.Combine(root, ".mbphotos");
+            Directory.CreateDirectory(control);
+            var descriptor = Path.Combine(control, "destination.json");
+            await File.WriteAllTextAsync(descriptor,
+                "{\"destinationId\":\"11111111-1111-4111-8111-111111111111\",\"createdAt\":\"2026-01-01T00:00:00Z\",\"formatVersion\":1,\"pathPolicyVersion\":1}");
+            var before = await File.ReadAllBytesAsync(descriptor);
+            await ThrowsAsync<InvalidDataException>(() =>
+                new DestinationManager(JsonOptions).OpenOrInitializeAsync(root, true));
+            True(before.SequenceEqual(await File.ReadAllBytesAsync(descriptor)));
+            True(!Directory.Exists(Path.Combine(root, DestinationContext.DataDirectoryName)));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
     }
 
     private static async Task TestCoordinatorActivityIsolationAsync()
@@ -887,8 +1329,9 @@ internal static class Program
     private static async Task TestDestinationAndLedgerAsync()
     {
         await using var context = await TestContext.CreateAsync();
-        True(File.Exists(Path.Combine(context.Root, ".mbphotos", "destination.json")));
-        True(File.Exists(Path.Combine(context.Root, ".mbphotos", "ledger.sqlite")));
+        True(File.Exists(Path.Combine(context.Destination.ControlPath, "destination.json")));
+        True(File.Exists(Path.Combine(context.Destination.ControlPath, "ledger.sqlite")));
+        True(File.Exists(Path.Combine(context.Destination.DataPath, "library.json")));
         var reopened = await context.DestinationManager.OpenOrInitializeAsync(context.Root, false);
         Equal(context.Destination.Info.DestinationId, reopened.Info.DestinationId);
     }
@@ -1001,7 +1444,7 @@ internal static class Program
             await verify.OpenAsync();
             var versionCommand = verify.CreateCommand();
             versionCommand.CommandText = "PRAGMA user_version";
-            Equal(3L, Convert.ToInt64(await versionCommand.ExecuteScalarAsync()));
+            Equal(4L, Convert.ToInt64(await versionCommand.ExecuteScalarAsync()));
         }
         finally
         {
@@ -1012,10 +1455,10 @@ internal static class Program
     private static async Task TestProtectedReceiverPathsAsync()
     {
         await using var context = await TestContext.CreateAsync();
-        var metadataPath = Path.Combine(context.Root, "Metadata", "assets.jsonl");
+        var metadataPath = Path.Combine(context.Destination.CatalogPath, "current.json");
         Directory.CreateDirectory(Path.GetDirectoryName(metadataPath)!);
         await File.WriteAllTextAsync(metadataPath, "receiver-owned metadata");
-        var destinationPath = Path.Combine(context.Root, ".mbphotos", "destination.json");
+        var destinationPath = Path.Combine(context.Destination.ControlPath, "destination.json");
         var destinationBefore = await File.ReadAllBytesAsync(destinationPath);
         var outside = TempDirectory();
         var outsideSentinel = Path.Combine(outside, "sentinel.txt");
@@ -1025,8 +1468,8 @@ internal static class Program
         {
             var attacks = new[]
             {
-                "Metadata/assets.jsonl",
-                ".mbphotos/destination.json",
+                "MB Photos Data/Catalog/current.json",
+                "MB Photos Data/.mbphotos/destination.json",
                 $"../{Path.GetFileName(outside)}/escape.jpg",
             };
             foreach (var proposedPath in attacks)
@@ -1122,7 +1565,7 @@ internal static class Program
         True(plan.Decisions.Single().AcceptedRelativePath!.Contains("~" + ids.FileId.ToString("N")[..8], StringComparison.Ordinal));
 
         var unrelatedIds = new StableIds();
-        var noAssociation = Job(bytes, unrelatedIds, Guid.NewGuid(), new string('a', 64), "Photos/2026/2026-08/2026-08-24/new-id.jpg");
+        var noAssociation = Job(bytes, unrelatedIds, Guid.NewGuid(), new string('a', 64), "Master/2026/2026-08/2026-08-24/new-id.jpg");
         Equal(JobFileAction.Upload, (await context.Coordinator.CreateJobAsync(noAssociation)).Decisions.Single().Action);
     }
 
@@ -1149,7 +1592,19 @@ internal static class Program
 
         var moveIds = new StableIds();
         var moveBytes = Encoding.UTF8.GetBytes("move then crash");
-        var moveJob = Job(moveBytes, moveIds, Guid.NewGuid(), new string('d', 64), "Photos/2026/2026-08/2026-08-24/moved.jpg");
+        var moveTemplate = Job(moveBytes, moveIds, Guid.NewGuid(), new string('d', 64));
+        var moveAsset = moveTemplate.Assets.Single();
+        var moveFile = moveAsset.Files.Single() with
+        {
+            StorageArea = StorageArea.LibraryData,
+            Roles = new[] { RepresentationRole.Auxiliary },
+            Criticality = Criticality.Optional,
+            ProposedRelativePath = $"MB Photos Data/Resources/{moveIds.AssetId:D}/{moveIds.FileId:D}.jpg",
+        };
+        var moveJob = moveTemplate with
+        {
+            Assets = new[] { moveAsset with { Files = new[] { moveFile }, MasterFileId = null } },
+        };
         var movePlan = await context.Coordinator.CreateJobAsync(moveJob);
         await context.Coordinator.PutChunkAsync(moveJob.JobId, moveIds.FileId, 0, 0, moveBytes.Length - 1, moveBytes.Length, Sha(moveBytes), new MemoryStream(moveBytes));
         var target = Path.Combine(context.Root, movePlan.Decisions.Single().AcceptedRelativePath!.Replace('/', Path.DirectorySeparatorChar));
@@ -1234,6 +1689,7 @@ internal static class Program
         Equal(bytes.LongLength, stats.BytesTransferred);
         Equal(bytes.LongLength, stats.BytesCommitted);
         Equal(1, stats.VerifiedOriginalFiles);
+        await context.Coordinator.CompleteAsync(job.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
 
         var skipJob = Job(bytes, ids, Guid.NewGuid(), new string('9', 64));
         await context.Coordinator.CreateJobAsync(skipJob);
@@ -1296,10 +1752,11 @@ internal static class Program
         var committedBytes = Encoding.UTF8.GetBytes("keep committed");
         var committedJob = Job(committedBytes, committedIds, Guid.NewGuid(), new string('1', 64));
         var committed = await UploadAndCommitAsync(context, committedJob, committedIds.FileId, committedBytes);
+        await context.Coordinator.CompleteAsync(committedJob.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
 
         var pendingIds = new StableIds();
         var pendingBytes = Encoding.UTF8.GetBytes("discard partial");
-        var pendingJob = Job(pendingBytes, pendingIds, Guid.NewGuid(), new string('2', 64), "Photos/2026/2026-08/2026-08-24/pending.jpg");
+        var pendingJob = Job(pendingBytes, pendingIds, Guid.NewGuid(), new string('2', 64), "Master/2026/2026-08/2026-08-24/pending.jpg");
         await context.Coordinator.CreateJobAsync(pendingJob);
         await context.Coordinator.PutChunkAsync(pendingJob.JobId, pendingIds.FileId, 0, 0, pendingBytes.Length - 1, pendingBytes.Length, Sha(pendingBytes), new MemoryStream(pendingBytes));
         var abandoned = await context.Coordinator.AbandonAsync(pendingJob.JobId, new AbandonJobRequest("userDiscarded"));
@@ -1331,11 +1788,11 @@ internal static class Program
         await using var context = await TestContext.CreateAsync();
         var outside = Path.Combine(Path.GetTempPath(), "mbphotos-outside-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(outside);
-        var link = Path.Combine(context.Root, "Photos", "linked");
+        var link = Path.Combine(context.Root, "Master", "linked");
         try
         {
             Directory.CreateSymbolicLink(link, outside);
-            var exception = Throws<ReceiverApiException>(() => context.PathPolicy.ResolveUnderRoot(context.Root, "Photos/linked/escape.jpg"));
+            var exception = Throws<ReceiverApiException>(() => context.PathPolicy.ResolveUnderRoot(context.Root, "Master/linked/escape.jpg"));
             Equal(ErrorCodes.ChangedDestination, exception.Error.Code);
             True(!File.Exists(Path.Combine(outside, "escape.jpg")));
         }
@@ -1375,18 +1832,18 @@ internal static class Program
                 string.Equals(Convert.ToHexString(SHA256.HashData(certificate.RawData)).ToLowerInvariant(), server.CertificateFingerprint, StringComparison.Ordinal),
         };
         using var client = new HttpClient(handler) { BaseAddress = server.BaseUri };
-        var unauthorized = await client.GetAsync("v1/jobs/11111111-1111-4111-8111-111111111111");
+        var unauthorized = await client.GetAsync("v2/jobs/11111111-1111-4111-8111-111111111111");
         Equal(HttpStatusCode.Unauthorized, unauthorized.StatusCode);
         var unauthorizedError = await unauthorized.Content.ReadFromJsonAsync<ApiError>(JsonOptions);
         Equal(ErrorCodes.AuthenticationRequired, unauthorizedError!.Code);
 
         var token = QueryValue(server.QrPayload, "token");
-        var response = await client.PostAsJsonAsync("v1/pair", PairRequest(token), JsonOptions);
+        var response = await client.PostAsJsonAsync("v2/pair", PairRequest(token), JsonOptions);
         response.EnsureSuccessStatusCode();
         Equal("no-store", response.Headers.CacheControl?.ToString());
         var paired = await response.Content.ReadFromJsonAsync<PairResponse>(JsonOptions);
         client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", paired!.SessionToken);
-        var missing = await client.GetAsync("v1/jobs/11111111-1111-4111-8111-111111111111");
+        var missing = await client.GetAsync("v2/jobs/11111111-1111-4111-8111-111111111111");
         Equal(HttpStatusCode.NotFound, missing.StatusCode);
         }
         Directory.Delete(root, true);
@@ -1402,13 +1859,13 @@ internal static class Program
         await context.Coordinator.CreateJobAsync(job);
         await context.Coordinator.CommitAsync(job.JobId, ids.FileId, new CommitFileRequest(0, Sha(bytes)));
         await context.Coordinator.CompleteAsync(job.JobId, new CompleteJobRequest(DateTimeOffset.UtcNow));
-        var csv = await File.ReadAllTextAsync(Path.Combine(context.Root, "Metadata", "albums.csv"));
-        True(csv.Contains("'=HYPERLINK", StringComparison.Ordinal));
-        var jsonl = await File.ReadAllTextAsync(Path.Combine(context.Root, "Metadata", "albums.jsonl"));
+        var pointer = JsonSerializer.Deserialize<CatalogPointer>(
+            await File.ReadAllTextAsync(Path.Combine(context.Destination.CatalogPath, "current.json")), JsonOptions)!;
+        var jsonl = await File.ReadAllTextAsync(context.PathPolicy.ResolveUnderRoot(context.Root, pointer.AlbumsRelativePath));
         True(jsonl.Contains("=HYPERLINK", StringComparison.Ordinal));
-        var assets = await File.ReadAllTextAsync(Path.Combine(context.Root, "Metadata", "assets.jsonl"));
+        var assets = await File.ReadAllTextAsync(context.PathPolicy.ResolveUnderRoot(context.Root, pointer.AssetsRelativePath));
         True(assets.Contains(Sha(bytes), StringComparison.Ordinal));
-        True(!Directory.EnumerateFiles(Path.Combine(context.Root, ".mbphotos"), "manifest-build-*").Any(),
+        True(!Directory.EnumerateFiles(context.Destination.ControlPath, "manifest-build-*").Any(),
             "manifest index scratch files must be removed after atomic output");
     }
 
@@ -1423,7 +1880,10 @@ internal static class Program
         var failedFile = asset.Files.Single() with
         {
             FileId = failedFileId,
-            ProposedRelativePath = "Photos/2026/2026-08/2026-08-24/unavailable.jpg",
+            StorageArea = StorageArea.LibraryData,
+            Roles = new[] { RepresentationRole.Auxiliary },
+            Criticality = Criticality.Optional,
+            ProposedRelativePath = $"MB Photos Data/Resources/{ids.AssetId:D}/{failedFileId:D}.jpg",
         };
         var job = original with { Assets = new[] { asset with { Files = new[] { asset.Files.Single(), failedFile } } } };
         await context.Coordinator.CreateJobAsync(job);
@@ -1450,7 +1910,10 @@ internal static class Program
         True(status.Report is not null);
         Equal(1, status.CommittedFiles.Count);
         Equal(JobFileAction.Conflict, status.Decisions.Single(decision => decision.FileId == failedFileId).Action);
-        var assetsJsonl = await File.ReadAllTextAsync(Path.Combine(context.Root, "Metadata", "assets.jsonl"));
+        var pointer = JsonSerializer.Deserialize<CatalogPointer>(
+            await File.ReadAllTextAsync(Path.Combine(context.Destination.CatalogPath, "current.json")), JsonOptions)!;
+        var assetsJsonl = await File.ReadAllTextAsync(
+            context.PathPolicy.ResolveUnderRoot(context.Root, pointer.AssetsRelativePath));
         True(assetsJsonl.Contains(Sha(bytes), StringComparison.Ordinal));
         True(assetsJsonl.Contains(failedFileId.ToString("D"), StringComparison.Ordinal));
         var repeatedPlan = await context.Coordinator.CreateJobAsync(job);
@@ -1461,7 +1924,7 @@ internal static class Program
         var changedJob = job with { SourceTimeZone = "America/Chicago" };
         Equal(ErrorCodes.JobConflict, (await ThrowsAsync<ReceiverApiException>(() => context.Coordinator.CreateJobAsync(changedJob))).Error.Code);
 
-        var duplicateJob = Job(bytes, new StableIds(), Guid.NewGuid(), new string('8', 64), "Photos/2026/2026-08/2026-08-24/failure.jpg");
+        var duplicateJob = Job(bytes, new StableIds(), Guid.NewGuid(), new string('8', 64), "Master/2026/2026-08/2026-08-24/failure.jpg");
         await context.Coordinator.CreateJobAsync(duplicateJob);
         var duplicateId = duplicateJob.Assets.Single().Files.Single().FileId;
         var duplicateFailure = new CompletionFailure(duplicateId, ErrorCodes.UnavailableSource, "Unavailable.", false);
@@ -1484,15 +1947,24 @@ internal static class Program
             var file = new ExportFile(
                 fileId,
                 assetId,
-                ExportFileKind.OriginalResource,
-                ResourceType.Photo,
+                revision,
+                StorageArea.LibraryData,
+                new[] { RepresentationRole.Auxiliary },
+                Criticality.Optional,
+                Provenance.ExactPhotoKitResource,
+                "photo",
+                1,
                 "asset.jpg",
-                $"Photos/stress/{index:D6}.jpg",
+                $"MB Photos Data/Resources/{assetId:D}/{fileId:D}.jpg",
+                "public.jpeg",
+                "image/jpeg",
+                1,
+                1,
+                null,
                 0,
                 HashOfEmptyFile,
-                revision,
                 timestamp,
-                "image/jpeg");
+                Availability.Available);
             assets[index] = new ExportAsset(
                 assetId,
                 $"stress/L0/{index:D6}",
@@ -1503,7 +1975,10 @@ internal static class Program
                 null,
                 false,
                 new RecoveryFingerprint(timestamp, 1, 1, null, "photo", recoveryNames, recoverySizes),
-                new[] { file });
+                new[] { file },
+                null,
+                null,
+                null);
         }
 
         var job = new ExportJob(
@@ -1511,7 +1986,7 @@ internal static class Program
             Guid.NewGuid(),
             DateTimeOffset.UtcNow,
             "Etc/UTC",
-            new ExportProfile(ExportProfileKind.PreserveOriginals, 1, true),
+            new ExportProfile(ExportProfileKind.PortableLibrary, 2),
             new SelectionSnapshot(SelectionKind.AllAccessible, assetCount),
             assets,
             Array.Empty<AlbumMembership>());
@@ -1620,22 +2095,31 @@ internal static class Program
         StableIds ids,
         Guid jobId,
         string revision,
-        string proposed = "Photos/2026/2026-08/2026-08-24/photo.jpg",
+        string proposed = "Master/2026/2026-08/2026-08-24/photo.jpg",
         string albumTitle = "Test Album")
     {
         var timestamp = new DateTimeOffset(2026, 8, 24, 12, 0, 0, TimeSpan.Zero);
         var file = new ExportFile(
             ids.FileId,
             ids.AssetId,
-            ExportFileKind.OriginalResource,
-            ResourceType.Photo,
+            revision,
+            StorageArea.Master,
+            new[] { RepresentationRole.MasterCurrent, RepresentationRole.RootOriginal },
+            Criticality.MasterRequired,
+            Provenance.ExactPhotoKitResource,
+            "photo",
+            1,
             "photo.jpg",
             proposed,
+            "public.jpeg",
+            "image/jpeg",
+            100,
+            100,
+            null,
             bytes.LongLength,
             null,
-            revision,
             timestamp,
-            "image/jpeg");
+            Availability.Available);
         var asset = new ExportAsset(
             ids.AssetId,
             "source/L0/001",
@@ -1646,17 +2130,93 @@ internal static class Program
             null,
             false,
             new RecoveryFingerprint(timestamp, 100, 100, null, "photo", new[] { "photo.jpg" }, new long?[] { bytes.LongLength }),
-            new[] { file });
+            new[] { file },
+            null,
+            ids.FileId,
+            null);
         return new ExportJob(
             ProtocolConstants.Version,
             jobId,
             DateTimeOffset.UtcNow,
             "Etc/UTC",
-            new ExportProfile(ExportProfileKind.PreserveOriginals, 1, true),
+            new ExportProfile(ExportProfileKind.PortableLibrary, 2),
             new SelectionSnapshot(SelectionKind.Manual, 1),
             new[] { asset },
             new[] { new AlbumMembership(ids.AlbumId, "album/L0/001", albumTitle, null, ids.AssetId) });
     }
+
+    private static ExportFile PortableFile(
+        Guid fileId,
+        Guid assetId,
+        string contentRevision,
+        StorageArea storageArea,
+        IReadOnlyList<RepresentationRole> roles,
+        Criticality criticality,
+        string originalFilename,
+        string proposedRelativePath,
+        byte[]? bytes,
+        string photoKitResourceType = "photo",
+        string contentType = "image/jpeg",
+        Availability availability = Availability.Available) => new(
+            fileId,
+            assetId,
+            contentRevision,
+            storageArea,
+            roles,
+            criticality,
+            Provenance.ExactPhotoKitResource,
+            photoKitResourceType,
+            photoKitResourceType == "photo" ? 1 : 3,
+            originalFilename,
+            proposedRelativePath,
+            contentType == "video/quicktime" ? "com.apple.quicktime-movie" : "public.jpeg",
+            contentType,
+            contentType == "video/quicktime" ? null : 100,
+            contentType == "video/quicktime" ? null : 100,
+            contentType == "video/quicktime" ? 1_000 : null,
+            bytes?.LongLength,
+            bytes is null ? null : Sha(bytes),
+            new DateTimeOffset(2026, 8, 24, 12, 0, 0, TimeSpan.Zero),
+            availability);
+
+    private static ExportJob PortableJob(
+        Guid assetId,
+        string sourceRevision,
+        bool isEdited,
+        IReadOnlyList<ExportFile> files,
+        Guid? masterFileId,
+        LivePhotoRelationships? livePhotoRelationships = null) => new(
+            ProtocolConstants.Version,
+            Guid.NewGuid(),
+            DateTimeOffset.UtcNow,
+            "Etc/UTC",
+            new ExportProfile(ExportProfileKind.PortableLibrary, 2),
+            new SelectionSnapshot(SelectionKind.Manual, 1),
+            new[]
+            {
+                new ExportAsset(
+                    assetId,
+                    $"source/{assetId:D}",
+                    sourceRevision,
+                    "photo",
+                    livePhotoRelationships is null ? Array.Empty<string>() : new[] { "livePhoto" },
+                    new DateTimeOffset(2026, 8, 24, 12, 0, 0, TimeSpan.Zero),
+                    null,
+                    isEdited,
+                    new RecoveryFingerprint(
+                        new DateTimeOffset(2026, 8, 24, 12, 0, 0, TimeSpan.Zero),
+                        100,
+                        100,
+                        null,
+                        "photo",
+                        files.Select(static file => file.OriginalFilename).ToArray(),
+                        files.Select(static file => file.ByteCount).ToArray()),
+                    files,
+                    null,
+                    masterFileId,
+                    livePhotoRelationships),
+            },
+            Array.Empty<AlbumMembership>());
 
     private static PairRequest PairRequest(string token) => new(
         ProtocolConstants.Version,
@@ -1811,7 +2371,10 @@ internal static class Program
             var policy = new WindowsPathPolicy();
             var transfer = new FileTransferService(destination, manager, ledger, policy);
             var writer = new ManifestWriter(destination, ledger, policy, JsonOptions);
-            var coordinator = new JobCoordinator(destination, manager, ledger, policy, transfer, writer, JsonOptions);
+            var promotion = new MasterPromotionService(destination, ledger, policy, JsonOptions);
+            var reuse = new RepresentationReuseService(destination, ledger, policy);
+            var superseded = new SupersededRepresentationService(destination, ledger, policy);
+            var coordinator = new JobCoordinator(destination, manager, ledger, policy, transfer, writer, promotion, reuse, superseded, JsonOptions);
             return new TestContext(root, manager, destination, policy, ledger, coordinator);
         }
 

@@ -50,6 +50,11 @@ public sealed class FileTransferService
         try
         {
             var file = await GetPendingFileAsync(jobId, fileId, cancellationToken);
+            if (file.Availability != Availability.Available)
+            {
+                throw new ReceiverApiException(409, ErrorCodes.UnavailableSource,
+                    "The source marked this representation unavailable; it cannot accept upload bytes.");
+            }
             if (file.ExpectedBytes is not null && file.ExpectedBytes != total)
             {
                 throw new ReceiverApiException(409, ErrorCodes.ChangedDestination, "The upload byte count differs from the frozen manifest.");
@@ -180,6 +185,12 @@ public sealed class FileTransferService
                 throw new ReceiverApiException(409, ErrorCodes.FileConflict, "The file was already committed with different content.");
             }
 
+            if (file.Availability != Availability.Available)
+            {
+                throw new ReceiverApiException(409, ErrorCodes.UnavailableSource,
+                    "The source marked this representation unavailable; it cannot be committed.");
+            }
+
             if (file.ExpectedBytes is not null && file.ExpectedBytes != request.ByteCount)
             {
                 throw new ReceiverApiException(409, ErrorCodes.ChangedDestination, "The commit byte count differs from the frozen manifest.");
@@ -202,7 +213,7 @@ public sealed class FileTransferService
             var partialPath = PartialPath(jobId, fileId);
             pathPolicy.EnsureNoReparsePoints(destination.RootPath, partialPath);
             var targetPath = pathPolicy.ResolveUnderRoot(destination.RootPath, file.RelativePath);
-            if (!File.Exists(partialPath) && File.Exists(targetPath))
+            if (file.StorageArea != StorageArea.Master && !File.Exists(partialPath) && File.Exists(targetPath))
             {
                 var targetInfo = new FileInfo(targetPath);
                 var targetHash = targetInfo.Length == request.ByteCount
@@ -245,6 +256,24 @@ public sealed class FileTransferService
                 await ledger.ClearChunksAsync(jobId, fileId, cancellationToken);
                 await ledger.AddFailureAsync(jobId, fileId, ErrorCodes.HashMismatch, "Whole-file SHA-256 verification failed.", true, cancellationToken);
                 throw new ReceiverApiException(422, ErrorCodes.HashMismatch, "Whole-file SHA-256 verification failed. The received bytes were quarantined.", true);
+            }
+
+            if (file.StorageArea == StorageArea.Master)
+            {
+                // Master representations remain receiver-owned staged bytes until
+                // job completion. Promotion verifies the prior active Master and
+                // journals the swap, so a newly edited image can never overwrite
+                // a user-modified Master file during an ordinary file commit.
+                var verifiedAt = DateTimeOffset.UtcNow;
+                await ledger.MarkCommittedAsync(
+                    jobId,
+                    fileId,
+                    actualHash,
+                    request.ByteCount,
+                    verifiedAt,
+                    File.GetLastWriteTimeUtc(partialPath).Ticks,
+                    cancellationToken);
+                return new CommittedFile(fileId, "committed", file.RelativePath, request.ByteCount, actualHash, verifiedAt);
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);

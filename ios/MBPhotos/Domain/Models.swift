@@ -41,6 +41,9 @@ enum PhotoResourceKind: String, Codable, Hashable, Sendable {
 struct PhotoResourceDescriptor: Codable, Hashable, Identifiable, Sendable {
     let id: String
     let kind: PhotoResourceKind
+    /// Preserves the PhotoKit numeric resource type even when a newer iOS
+    /// resource is not yet known to this build.
+    let rawResourceType: Int?
     let originalFilename: String
     let uniformTypeIdentifier: String?
     let pixelWidth: Int
@@ -50,6 +53,7 @@ struct PhotoResourceDescriptor: Codable, Hashable, Identifiable, Sendable {
     init(
         id: String,
         kind: PhotoResourceKind,
+        rawResourceType: Int? = nil,
         originalFilename: String,
         uniformTypeIdentifier: String?,
         pixelWidth: Int = 0,
@@ -58,6 +62,7 @@ struct PhotoResourceDescriptor: Codable, Hashable, Identifiable, Sendable {
     ) {
         self.id = id
         self.kind = kind
+        self.rawResourceType = rawResourceType
         self.originalFilename = originalFilename
         self.uniformTypeIdentifier = uniformTypeIdentifier
         self.pixelWidth = pixelWidth
@@ -230,7 +235,6 @@ struct PhotoAsset: Codable, Hashable, Identifiable, Sendable {
             mediaSubtypes.map(\.rawValue).sorted().joined(separator: ","),
             resourcePart,
             ExportConstants.profileVersion.description,
-            ExportConstants.jpegRendererVersion,
             String(isEdited)
         ]
         return SHA256.hash(data: Data(parts.joined(separator: "|").utf8)).hexString
@@ -325,6 +329,10 @@ enum SelectionSource: Equatable, Sendable {
     case dateRange(start: Date, end: Date)
     case albums(Set<String>)
     case manual(Set<String>)
+    /// A quick-selection export can combine individually chosen assets with
+    /// whole albums. The wire protocol still describes this as a manual
+    /// selection while preserving the selected album identifiers as metadata.
+    case custom(assetIDs: Set<String>, albumIDs: Set<String>)
 
     var kind: SelectionKind {
         switch self {
@@ -332,7 +340,7 @@ enum SelectionSource: Equatable, Sendable {
         case .newOrChanged: .newOrChanged
         case .dateRange: .dateRange
         case .albums: .albums
-        case .manual: .manual
+        case .manual, .custom: .manual
         }
     }
 }
@@ -364,13 +372,19 @@ struct FrozenSelection: Sendable, Equatable {
 }
 
 enum ExportProfileKind: String, Codable, CaseIterable, Sendable {
+    case portableLibrary
+    // Decoding-only legacy values keep v1 history visible. New planning and
+    // receiver capability checks accept only `portableLibrary`.
     case preserveOriginals
     case originalsAndCurrentJpegs
 
+    static var allCases: [ExportProfileKind] { [.portableLibrary] }
+
     var label: String {
         switch self {
-        case .preserveOriginals: "Preserve originals"
-        case .originalsAndCurrentJpegs: "Originals + current JPEGs"
+        case .portableLibrary: "Portable Master Library"
+        case .preserveOriginals: "Legacy originals"
+        case .originalsAndCurrentJpegs: "Legacy originals + JPEGs"
         }
     }
 }
@@ -378,22 +392,47 @@ enum ExportProfileKind: String, Codable, CaseIterable, Sendable {
 struct ExportProfile: Codable, Equatable, Sendable {
     let kind: ExportProfileKind
     let profileVersion: Int
-    let preserveLocation: Bool
-    let jpegRendererVersion: String?
 
-    init(kind: ExportProfileKind, preserveLocation: Bool) {
+    init(kind: ExportProfileKind = .portableLibrary) {
         self.kind = kind
         self.profileVersion = ExportConstants.profileVersion
-        self.preserveLocation = preserveLocation
-        self.jpegRendererVersion = kind == .originalsAndCurrentJpegs
-            ? ExportConstants.jpegRendererVersion
-            : nil
     }
 }
 
-enum ExportFileKind: String, Codable, Sendable {
-    case originalResource
-    case currentJpeg
+enum StorageArea: String, Codable, Hashable, Sendable {
+    case master
+    case libraryData
+}
+
+enum RepresentationRole: String, Codable, Hashable, Sendable {
+    case masterCurrent
+    case rootOriginal
+    case currentLiveMotion
+    case originalLiveMotion
+    case adjustmentBase
+    case adjustmentRecipe
+    case alternateOriginal
+    case auxiliary
+}
+
+enum Criticality: String, Codable, Sendable {
+    case masterRequired
+    case archiveRequired
+    case optional
+}
+
+enum Provenance: String, Codable, Sendable {
+    case exactPhotoKitResource
+    case generatedThumbnail
+}
+
+enum ResourceAvailability: String, Codable, Sendable {
+    case available
+    case sourceUnavailable
+    case transferFailed
+    case missing
+    case tampered
+    case superseded
 }
 
 struct Destination: Codable, Equatable, Sendable {
@@ -402,6 +441,7 @@ struct Destination: Codable, Equatable, Sendable {
     let createdAt: Date
     let freeBytes: Int64
     let pathPolicyVersion: Int
+    let destinationFormatVersion: Int
 }
 
 struct RecoveryFingerprint: Codable, Equatable, Sendable {
@@ -446,40 +486,99 @@ struct RecoveryFingerprint: Codable, Equatable, Sendable {
 struct ExportFile: Codable, Identifiable, Equatable, Sendable {
     let fileId: UUID
     let assetId: UUID
-    let kind: ExportFileKind
-    let resourceType: PhotoResourceKind
+    let contentRevision: String
+    let storageArea: StorageArea
+    let roles: [RepresentationRole]
+    let criticality: Criticality
+    let provenance: Provenance
+    let photoKitResourceType: PhotoResourceKind?
+    let photoKitResourceTypeRaw: Int?
     let originalFilename: String
     let proposedRelativePath: String
+    let uniformTypeIdentifier: String?
+    let contentType: String?
+    let pixelWidth: Int?
+    let pixelHeight: Int?
+    let durationMilliseconds: Int?
     var byteCount: Int64?
     var sha256: String?
-    let sourceRevision: String
     let captureDate: Date?
-    let contentType: String?
+    let availability: ResourceAvailability
 
     var id: UUID { fileId }
+    /// The local ledger predates protocol v2's per-file terminology. Keep the
+    /// internal alias until its storage column is migrated; it is not encoded.
+    var sourceRevision: String { contentRevision }
 
     private enum CodingKeys: String, CodingKey {
         case fileId
         case assetId
-        case kind
-        case resourceType
+        case contentRevision
+        case storageArea
+        case roles
+        case criticality
+        case provenance
+        case photoKitResourceType
+        case photoKitResourceTypeRaw
         case originalFilename
         case proposedRelativePath
+        case uniformTypeIdentifier
+        case contentType
+        case pixelWidth
+        case pixelHeight
+        case durationMilliseconds
         case byteCount
         case sha256
-        case sourceRevision
         case captureDate
-        case contentType
+        case availability
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(fileId, forKey: .fileId)
         try container.encode(assetId, forKey: .assetId)
-        try container.encode(kind, forKey: .kind)
-        try container.encode(resourceType, forKey: .resourceType)
+        try container.encode(contentRevision, forKey: .contentRevision)
+        try container.encode(storageArea, forKey: .storageArea)
+        try container.encode(roles, forKey: .roles)
+        try container.encode(criticality, forKey: .criticality)
+        try container.encode(provenance, forKey: .provenance)
+        if let photoKitResourceType {
+            try container.encode(photoKitResourceType, forKey: .photoKitResourceType)
+        } else {
+            try container.encodeNil(forKey: .photoKitResourceType)
+        }
+        if let photoKitResourceTypeRaw {
+            try container.encode(photoKitResourceTypeRaw, forKey: .photoKitResourceTypeRaw)
+        } else {
+            try container.encodeNil(forKey: .photoKitResourceTypeRaw)
+        }
         try container.encode(originalFilename, forKey: .originalFilename)
         try container.encode(proposedRelativePath, forKey: .proposedRelativePath)
+        if let uniformTypeIdentifier {
+            try container.encode(uniformTypeIdentifier, forKey: .uniformTypeIdentifier)
+        } else {
+            try container.encodeNil(forKey: .uniformTypeIdentifier)
+        }
+        if let contentType {
+            try container.encode(contentType, forKey: .contentType)
+        } else {
+            try container.encodeNil(forKey: .contentType)
+        }
+        if let pixelWidth {
+            try container.encode(pixelWidth, forKey: .pixelWidth)
+        } else {
+            try container.encodeNil(forKey: .pixelWidth)
+        }
+        if let pixelHeight {
+            try container.encode(pixelHeight, forKey: .pixelHeight)
+        } else {
+            try container.encodeNil(forKey: .pixelHeight)
+        }
+        if let durationMilliseconds {
+            try container.encode(durationMilliseconds, forKey: .durationMilliseconds)
+        } else {
+            try container.encodeNil(forKey: .durationMilliseconds)
+        }
         if let byteCount {
             try container.encode(byteCount, forKey: .byteCount)
         } else {
@@ -490,17 +589,43 @@ struct ExportFile: Codable, Identifiable, Equatable, Sendable {
         } else {
             try container.encodeNil(forKey: .sha256)
         }
-        try container.encode(sourceRevision, forKey: .sourceRevision)
         if let captureDate {
             try container.encode(captureDate, forKey: .captureDate)
         } else {
             try container.encodeNil(forKey: .captureDate)
         }
-        if let contentType {
-            try container.encode(contentType, forKey: .contentType)
-        } else {
-            try container.encodeNil(forKey: .contentType)
-        }
+        try container.encode(availability, forKey: .availability)
+    }
+}
+
+struct LivePhotoRelationships: Codable, Equatable, Sendable {
+    let currentStillFileId: UUID?
+    let currentMotionFileId: UUID?
+    let originalStillFileId: UUID?
+    let originalMotionFileId: UUID?
+
+    private enum CodingKeys: String, CodingKey {
+        case currentStillFileId
+        case currentMotionFileId
+        case originalStillFileId
+        case originalMotionFileId
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try Self.encode(currentStillFileId, forKey: .currentStillFileId, into: &container)
+        try Self.encode(currentMotionFileId, forKey: .currentMotionFileId, into: &container)
+        try Self.encode(originalStillFileId, forKey: .originalStillFileId, into: &container)
+        try Self.encode(originalMotionFileId, forKey: .originalMotionFileId, into: &container)
+    }
+
+    private static func encode(
+        _ value: UUID?,
+        forKey key: CodingKeys,
+        into container: inout KeyedEncodingContainer<CodingKeys>
+    ) throws {
+        if let value { try container.encode(value, forKey: key) }
+        else { try container.encodeNil(forKey: key) }
     }
 }
 
@@ -515,6 +640,8 @@ struct ExportAsset: Codable, Identifiable, Equatable, Sendable {
     let location: AssetLocation?
     let isEdited: Bool
     let recoveryFingerprint: RecoveryFingerprint
+    let masterFileId: UUID?
+    let livePhotoRelationships: LivePhotoRelationships?
     var files: [ExportFile]
 
     var id: UUID { assetId }
@@ -530,6 +657,8 @@ struct ExportAsset: Codable, Identifiable, Equatable, Sendable {
         case location
         case isEdited
         case recoveryFingerprint
+        case masterFileId
+        case livePhotoRelationships
         case files
     }
 
@@ -553,6 +682,16 @@ struct ExportAsset: Codable, Identifiable, Equatable, Sendable {
         try container.encodeIfPresent(location, forKey: .location)
         try container.encode(isEdited, forKey: .isEdited)
         try container.encode(recoveryFingerprint, forKey: .recoveryFingerprint)
+        if let masterFileId {
+            try container.encode(masterFileId, forKey: .masterFileId)
+        } else {
+            try container.encodeNil(forKey: .masterFileId)
+        }
+        if let livePhotoRelationships {
+            try container.encode(livePhotoRelationships, forKey: .livePhotoRelationships)
+        } else {
+            try container.encodeNil(forKey: .livePhotoRelationships)
+        }
         try container.encode(files, forKey: .files)
     }
 }
@@ -623,13 +762,14 @@ enum JobState: String, Codable, Sendable {
 
 struct CompletionCounts: Codable, Equatable, Sendable {
     let assetsPlanned: Int
+    let assetsPromoted: Int
+    let assetsArchiveIncomplete: Int
     let filesPlanned: Int
     let filesCommitted: Int
     let filesSkipped: Int
     let filesFailed: Int
     let bytesTransferred: Int64
     let bytesCommitted: Int64
-    let verifiedOriginalFiles: Int
 }
 
 enum APIErrorCode: String, Codable, Sendable {
@@ -650,8 +790,11 @@ enum APIErrorCode: String, Codable, Sendable {
     case unsafePath = "unsafe_path"
     case hashMismatch = "hash_mismatch"
     case unavailableSource = "unavailable_source"
+    case masterConflict = "master_conflict"
+    case archiveIncomplete = "archive_incomplete"
     case networkLoss = "network_loss"
     case changedDestination = "changed_destination"
+    case destinationFormatMismatch = "destination_format_mismatch"
     case internalError = "internal_error"
 }
 
@@ -672,15 +815,25 @@ struct CompletionReport: Codable, Equatable, Sendable {
     let counts: CompletionCounts
     let failures: [CompletionFailure]
     let reportRelativePath: String
-    let manifestRelativePaths: [String]
+    let catalogGeneration: CatalogGeneration
+}
+
+struct CatalogGeneration: Codable, Equatable, Sendable {
+    let generationId: UUID
+    let catalogPointerRelativePath: String
+    let assetsRelativePath: String
+    let albumsRelativePath: String
 }
 
 enum ExportConstants {
-    static let protocolVersion = 1
-    static let profileVersion = 1
-    static let pathPolicyVersion = 1
-    static let jpegRendererVersion = "core-image-srgb-v1"
-    static let jpegQuality = 0.92
+    static let protocolVersion = 2
+    static let profileVersion = 2
+    static let pathPolicyVersion = 2
+    static let destinationFormatVersion = 2
+    static let catalogFormatVersion = 2
+    static let thumbnailRendererVersion = "core-image-thumbnail-srgb-v1"
+    static let thumbnailMaximumPixelDimension = 512
+    static let thumbnailJPEGQuality = 0.82
     static let chunkSize = 8 * 1_024 * 1_024
     static let maximumRelativePathLength = 239
 }

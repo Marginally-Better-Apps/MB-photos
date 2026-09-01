@@ -3,6 +3,7 @@ import CoreImage
 import CryptoKit
 import Foundation
 import ImageIO
+import UIKit
 import UniformTypeIdentifiers
 
 enum RenditionError: LocalizedError {
@@ -23,8 +24,8 @@ enum RenditionError: LocalizedError {
     }
 }
 
-protocol OriginalRenditionProviding: Sendable {
-    func materializeOriginal(
+protocol PhotoResourceMaterializing: Sendable {
+    func materializeResource(
         assetID: String,
         descriptor: PhotoResourceDescriptor,
         to outputURL: URL,
@@ -32,17 +33,16 @@ protocol OriginalRenditionProviding: Sendable {
     ) async throws
 }
 
-protocol CurrentJPEGRendering: Sendable {
-    func renderCurrentJPEG(
+protocol ThumbnailRendering: Sendable {
+    func renderThumbnail(
         assetID: String,
         to outputURL: URL,
-        preserveLocation: Bool,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws
 }
 
-actor PhotoKitRenditionProvider: OriginalRenditionProviding {
-    func materializeOriginal(
+actor PhotoKitRenditionProvider: PhotoResourceMaterializing {
+    func materializeResource(
         assetID: String,
         descriptor: PhotoResourceDescriptor,
         to outputURL: URL,
@@ -97,13 +97,12 @@ actor PhotoKitRenditionProvider: OriginalRenditionProviding {
     }
 }
 
-actor PhotoKitJPEGRenderer: CurrentJPEGRendering {
+actor PhotoKitThumbnailRenderer: ThumbnailRendering {
     private let imageManager = PHImageManager.default()
 
-    func renderCurrentJPEG(
+    func renderThumbnail(
         assetID: String,
         to outputURL: URL,
-        preserveLocation: Bool,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws {
         try Task.checkCancellation()
@@ -113,21 +112,22 @@ actor PhotoKitJPEGRenderer: CurrentJPEGRendering {
         )
         guard let asset = fetchResult.firstObject else { throw RenditionError.assetUnavailable(assetID) }
         progress(0.05)
-        let (data, orientation) = try await requestCurrentImageData(for: asset, progress: progress)
+        let data: Data
+        let orientation: CGImagePropertyOrientation
+        if asset.mediaType == .video {
+            data = try await requestCurrentPosterJPEG(for: asset, progress: progress)
+            orientation = .up
+        } else {
+            (data, orientation) = try await requestCurrentImageData(for: asset, progress: progress)
+        }
         try Task.checkCancellation()
         progress(0.75)
         try Self.encodeSRGBJPEG(
             sourceData: data,
             orientation: orientation,
             outputURL: outputURL,
-            preserveLocation: preserveLocation,
-            authoritativeLocation: asset.location.map {
-                AssetLocation(
-                    latitude: $0.coordinate.latitude,
-                    longitude: $0.coordinate.longitude,
-                    altitudeMeters: $0.verticalAccuracy >= 0 ? $0.altitude : nil
-                )
-            }
+            preserveLocation: false,
+            maximumPixelDimension: ExportConstants.thumbnailMaximumPixelDimension
         )
         progress(1)
     }
@@ -167,12 +167,61 @@ actor PhotoKitJPEGRenderer: CurrentJPEGRendering {
         }
     }
 
+    private func requestCurrentPosterJPEG(
+        for asset: PHAsset,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws -> Data {
+        let options = PHImageRequestOptions()
+        options.version = .current
+        options.deliveryMode = .highQualityFormat
+        options.resizeMode = .exact
+        options.isNetworkAccessAllowed = true
+        options.progressHandler = { value, _, _, _ in
+            progress(0.05 + value * 0.65)
+        }
+
+        let cancellation = PhotoImageRequestCancellation(manager: imageManager)
+        let target = CGSize(
+            width: ExportConstants.thumbnailMaximumPixelDimension,
+            height: ExportConstants.thumbnailMaximumPixelDimension
+        )
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let box = ThrowingDataContinuationBox(continuation)
+                let requestID = imageManager.requestImage(
+                    for: asset,
+                    targetSize: target,
+                    contentMode: .aspectFit,
+                    options: options
+                ) { image, info in
+                    if (info?[PHImageCancelledKey] as? Bool) == true {
+                        box.resume(throwing: RenditionError.cancelled)
+                    } else if let error = info?[PHImageErrorKey] as? Error {
+                        box.resume(throwing: error)
+                    } else if let image,
+                              (info?[PHImageResultIsDegradedKey] as? Bool) != true,
+                              let data = image.jpegData(
+                                compressionQuality: ExportConstants.thumbnailJPEGQuality
+                              ) {
+                        box.resume(returning: data)
+                    } else if (info?[PHImageResultIsDegradedKey] as? Bool) != true {
+                        box.resume(throwing: RenditionError.imageDecodeFailed)
+                    }
+                }
+                cancellation.setRequestID(requestID)
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
     static func encodeSRGBJPEG(
         sourceData: Data,
         orientation: CGImagePropertyOrientation,
         outputURL: URL,
         preserveLocation: Bool,
-        authoritativeLocation: AssetLocation? = nil
+        authoritativeLocation: AssetLocation? = nil,
+        maximumPixelDimension: Int? = nil
     ) throws {
         guard let imageSource = CGImageSourceCreateWithData(sourceData as CFData, nil),
               let ciImage = CIImage(
@@ -182,14 +231,23 @@ actor PhotoKitJPEGRenderer: CurrentJPEGRendering {
             throw RenditionError.imageDecodeFailed
         }
         let oriented = ciImage.oriented(forExifOrientation: Int32(orientation.rawValue))
+        let rendered: CIImage
+        if let maximumPixelDimension,
+           maximumPixelDimension > 0,
+           max(oriented.extent.width, oriented.extent.height) > CGFloat(maximumPixelDimension) {
+            let scale = CGFloat(maximumPixelDimension) / max(oriented.extent.width, oriented.extent.height)
+            rendered = oriented.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        } else {
+            rendered = oriented
+        }
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
         let context = CIContext(options: [
             .workingColorSpace: colorSpace,
             .outputColorSpace: colorSpace
         ])
         guard let cgImage = context.createCGImage(
-            oriented,
-            from: oriented.extent.integral,
+            rendered,
+            from: rendered.extent.integral,
             format: .RGBA8,
             colorSpace: colorSpace
         ) else {
@@ -232,7 +290,7 @@ enum JPEGMetadataPolicy {
             properties[kCGImagePropertyGPSDictionary] = gpsDictionary(authoritativeLocation)
         }
         properties[kCGImagePropertyOrientation] = 1
-        properties[kCGImageDestinationLossyCompressionQuality] = ExportConstants.jpegQuality
+        properties[kCGImageDestinationLossyCompressionQuality] = ExportConstants.thumbnailJPEGQuality
         properties[kCGImagePropertyPixelWidth] = nil
         properties[kCGImagePropertyPixelHeight] = nil
         return properties
@@ -344,6 +402,31 @@ private final class ThrowingImageContinuationBox: @unchecked Sendable {
     }
 
     private func take() -> CheckedContinuation<(Data, CGImagePropertyOrientation), Error>? {
+        lock.lock()
+        let current = continuation
+        continuation = nil
+        lock.unlock()
+        return current
+    }
+}
+
+private final class ThrowingDataContinuationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Data, Error>?
+
+    init(_ continuation: CheckedContinuation<Data, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(returning value: Data) {
+        take()?.resume(returning: value)
+    }
+
+    func resume(throwing error: Error) {
+        take()?.resume(throwing: error)
+    }
+
+    private func take() -> CheckedContinuation<Data, Error>? {
         lock.lock()
         let current = continuation
         continuation = nil

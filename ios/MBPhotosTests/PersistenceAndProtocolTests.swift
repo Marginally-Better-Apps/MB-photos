@@ -9,28 +9,30 @@ final class PersistenceAndProtocolTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let pairData = try Data(contentsOf: root.appending(path: "protocol/fixtures/v1/pair.response.json"))
+        let pairData = try Data(contentsOf: root.appending(path: "protocol/fixtures/v2/pair.response.json"))
         let pair = try WireCoders.decoder().decode(PairResponse.self, from: pairData)
         XCTAssertEqual(pair.capabilities.chunkSizeBytes, 8_388_608)
-        XCTAssertEqual(pair.destination.pathPolicyVersion, 1)
+        XCTAssertEqual(pair.destination.pathPolicyVersion, 2)
+        XCTAssertEqual(pair.destination.destinationFormatVersion, 2)
 
-        let jobData = try Data(contentsOf: root.appending(path: "protocol/fixtures/v1/create-job.request.json"))
+        let jobData = try Data(contentsOf: root.appending(path: "protocol/fixtures/v2/create-job.request.json"))
         let job = try WireCoders.decoder().decode(ExportJob.self, from: jobData)
         XCTAssertEqual(job.assets.count, 2)
-        XCTAssertEqual(job.files.count, 4)
+        XCTAssertEqual(job.files.count, 5)
         XCTAssertEqual(job.assets.first?.location?.latitude, 41.8781)
         XCTAssertEqual(job.assets.first?.location?.longitude, -87.6298)
 
-        let responseData = try Data(contentsOf: root.appending(path: "protocol/fixtures/v1/create-job.response.json"))
+        let responseData = try Data(contentsOf: root.appending(path: "protocol/fixtures/v2/create-job.response.json"))
         let plan = try WireCoders.decoder().decode(JobPlan.self, from: responseData)
         XCTAssertEqual(plan.decisions.first?.action, .resume)
         let preflight = PreflightSummary(
             assetCount: 2,
-            originalFileCount: 3,
-            generatedJPEGCount: 1,
+            masterFileCount: 2,
+            archiveFileCount: 3,
+            thumbnailFileCount: 0,
+            missingMasterCount: 0,
             estimatedKnownBytes: 1024,
             unknownByteCount: 0,
-            editedVideoCount: 0,
             warnings: []
         ).reconciled(with: plan)
         XCTAssertEqual(preflight.destinationFreeBytes, plan.destination.freeBytes)
@@ -38,14 +40,14 @@ final class PersistenceAndProtocolTests: XCTestCase {
         XCTAssertEqual(preflight.resumableFileCount, 1)
 
         let completeData = try Data(
-            contentsOf: root.appending(path: "protocol/fixtures/v1/complete-job-with-failures.request.json")
+            contentsOf: root.appending(path: "protocol/fixtures/v2/complete-job-with-failures.request.json")
         )
         let complete = try WireCoders.decoder().decode(CompleteJobRequest.self, from: completeData)
         XCTAssertEqual(complete.failures.count, 1)
         XCTAssertEqual(complete.failures.first?.code, .unavailableSource)
 
         let reportData = try Data(
-            contentsOf: root.appending(path: "protocol/fixtures/v1/completion-report-with-failures.response.json")
+            contentsOf: root.appending(path: "protocol/fixtures/v2/completion-report-with-failures.response.json")
         )
         let report = try WireCoders.decoder().decode(CompletionReport.self, from: reportData)
         XCTAssertEqual(report.state, .completedWithFailures)
@@ -62,6 +64,7 @@ final class PersistenceAndProtocolTests: XCTestCase {
         try roundTripFixture("pair.request.json", as: PairRequest.self)
         try roundTripFixture("pair.response.json", as: PairResponse.self)
         try roundTripFixture("create-job.request.json", as: ExportJob.self)
+        try roundTripFixture("scenario-matrix.request.json", as: ExportJob.self)
         try roundTripFixture("create-job.response.json", as: JobPlan.self)
         try roundTripFixture("job-status.response.json", as: JobStatusResponse.self)
         try roundTripFixture("chunk-receipt.response.json", as: ChunkReceipt.self)
@@ -81,15 +84,24 @@ final class PersistenceAndProtocolTests: XCTestCase {
         let file = ExportFile(
             fileId: UUID(),
             assetId: assetID,
-            kind: .originalResource,
-            resourceType: .photo,
+            contentRevision: String(repeating: "a", count: 64),
+            storageArea: .master,
+            roles: [.masterCurrent, .rootOriginal],
+            criticality: .masterRequired,
+            provenance: .exactPhotoKitResource,
+            photoKitResourceType: .photo,
+            photoKitResourceTypeRaw: 1,
             originalFilename: "IMG_0001.HEIC",
-            proposedRelativePath: "Photos/Undated/IMG_0001.HEIC",
+            proposedRelativePath: "Master/Undated/IMG_0001.HEIC",
+            uniformTypeIdentifier: nil,
+            contentType: nil,
+            pixelWidth: nil,
+            pixelHeight: nil,
+            durationMilliseconds: nil,
             byteCount: nil,
             sha256: nil,
-            sourceRevision: String(repeating: "a", count: 64),
             captureDate: nil,
-            contentType: nil
+            availability: .available
         )
         let fingerprint = RecoveryFingerprint(
             captureDate: nil,
@@ -111,6 +123,8 @@ final class PersistenceAndProtocolTests: XCTestCase {
             location: nil,
             isEdited: false,
             recoveryFingerprint: fingerprint,
+            masterFileId: file.fileId,
+            livePhotoRelationships: nil,
             files: [file]
         )
         let membership = AlbumMembership(
@@ -121,11 +135,11 @@ final class PersistenceAndProtocolTests: XCTestCase {
             assetId: assetID
         )
         let job = ExportJob(
-            protocolVersion: 1,
+            protocolVersion: ExportConstants.protocolVersion,
             jobId: UUID(),
             createdAt: Date(timeIntervalSince1970: 0),
             sourceTimeZone: "UTC",
-            profile: ExportProfile(kind: .preserveOriginals, preserveLocation: false),
+            profile: ExportProfile(),
             selection: ExportSelection(
                 kind: .allAccessible,
                 assetCount: 1,
@@ -139,7 +153,8 @@ final class PersistenceAndProtocolTests: XCTestCase {
             JSONSerialization.jsonObject(with: WireCoders.encoder().encode(job)) as? [String: Any]
         )
         let profileObject = try XCTUnwrap(root["profile"] as? [String: Any])
-        XCTAssertNil(profileObject["jpegRendererVersion"])
+        XCTAssertEqual(profileObject["kind"] as? String, "portableLibrary")
+        XCTAssertEqual(profileObject["profileVersion"] as? Int, 2)
         let assetObject = try XCTUnwrap((root["assets"] as? [[String: Any]])?.first)
         XCTAssertTrue(assetObject["creationDate"] is NSNull)
         XCTAssertTrue(assetObject["modificationDate"] is NSNull)
@@ -148,7 +163,10 @@ final class PersistenceAndProtocolTests: XCTestCase {
         XCTAssertTrue(fingerprintObject["captureDate"] is NSNull)
         XCTAssertTrue(fingerprintObject["durationMilliseconds"] is NSNull)
         let fileObject = try XCTUnwrap((assetObject["files"] as? [[String: Any]])?.first)
-        for key in ["byteCount", "sha256", "captureDate", "contentType"] {
+        for key in [
+            "byteCount", "sha256", "captureDate", "contentType",
+            "uniformTypeIdentifier", "pixelWidth", "pixelHeight", "durationMilliseconds"
+        ] {
             XCTAssertTrue(fileObject[key] is NSNull, "Expected required null for \(key)")
         }
         let membershipObject = try XCTUnwrap((root["albumMemberships"] as? [[String: Any]])?.first)
@@ -163,7 +181,7 @@ final class PersistenceAndProtocolTests: XCTestCase {
         let planned = try ExportPlanner().plan(
             selection: frozen,
             albums: [],
-            profile: ExportProfile(kind: .preserveOriginals, preserveLocation: true)
+            profile: ExportProfile()
         )
         try await ledger.savePlannedJob(planned.job)
         let loaded = try await ledger.loadJob(planned.job.jobId)
@@ -185,14 +203,15 @@ final class PersistenceAndProtocolTests: XCTestCase {
         let planned = try ExportPlanner().plan(
             selection: frozen,
             albums: [],
-            profile: ExportProfile(kind: .preserveOriginals, preserveLocation: true)
+            profile: ExportProfile()
         )
         let destination = Destination(
             destinationId: UUID(),
             displayName: "Fixture PC",
             createdAt: Date(timeIntervalSince1970: 100),
             freeBytes: 1_000_000,
-            pathPolicyVersion: ExportConstants.pathPolicyVersion
+            pathPolicyVersion: ExportConstants.pathPolicyVersion,
+            destinationFormatVersion: ExportConstants.destinationFormatVersion
         )
         try await firstLedger.savePlannedJob(planned.job)
         try await firstLedger.attachDestination(destination, to: planned.job.jobId)
@@ -221,7 +240,7 @@ final class PersistenceAndProtocolTests: XCTestCase {
         let terminal = try ExportPlanner().plan(
             selection: frozen,
             albums: [],
-            profile: ExportProfile(kind: .preserveOriginals, preserveLocation: true)
+            profile: ExportProfile()
         ).job
         let paused = ExportJob(
             protocolVersion: terminal.protocolVersion,
@@ -271,15 +290,24 @@ final class PersistenceAndProtocolTests: XCTestCase {
         let missingJobFile = ExportFile(
             fileId: UUID(),
             assetId: UUID(),
-            kind: .originalResource,
-            resourceType: orphan.kind,
+            contentRevision: String(repeating: "a", count: 64),
+            storageArea: .master,
+            roles: [.masterCurrent, .rootOriginal],
+            criticality: .masterRequired,
+            provenance: .exactPhotoKitResource,
+            photoKitResourceType: orphan.kind,
+            photoKitResourceTypeRaw: orphan.rawResourceType,
             originalFilename: orphan.originalFilename,
-            proposedRelativePath: "Photos/2026/IMG_0001.HEIC",
+            proposedRelativePath: "Master/2026/IMG_0001.HEIC",
+            uniformTypeIdentifier: orphan.uniformTypeIdentifier,
+            contentType: "image/heic",
+            pixelWidth: nil,
+            pixelHeight: nil,
+            durationMilliseconds: nil,
             byteCount: nil,
             sha256: nil,
-            sourceRevision: String(repeating: "a", count: 64),
             captureDate: nil,
-            contentType: "image/heic"
+            availability: .available
         )
         do {
             try await ledger.recordFile(
@@ -607,14 +635,17 @@ final class PersistenceAndProtocolTests: XCTestCase {
         XCTAssertEqual(retainedGPS?[kCGImagePropertyGPSLatitudeRef] as? String, "S")
         XCTAssertEqual(retainedGPS?[kCGImagePropertyGPSLongitude] as? Double, 151.21)
         XCTAssertEqual(retainedGPS?[kCGImagePropertyGPSLongitudeRef] as? String, "E")
-        XCTAssertEqual(retained[kCGImageDestinationLossyCompressionQuality] as? Double, 0.92)
+        XCTAssertEqual(
+            retained[kCGImageDestinationLossyCompressionQuality] as? Double,
+            ExportConstants.thumbnailJPEGQuality
+        )
     }
 
     func testFixtureRenditionProviderWritesKnownBytes() async throws {
         let data = Data("fixture-original".utf8)
         let output = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         let provider = FixtureOriginalProvider(bytes: data)
-        try await provider.materializeOriginal(
+        try await provider.materializeResource(
             assetID: "fixture",
             descriptor: FixtureFactory.asset().resources[0],
             to: output,
@@ -648,7 +679,7 @@ final class PersistenceAndProtocolTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let data = try Data(contentsOf: root.appending(path: "protocol/fixtures/v1/\(name)"))
+        let data = try Data(contentsOf: root.appending(path: "protocol/fixtures/v2/\(name)"))
         let decoded = try WireCoders.decoder().decode(type, from: data)
         _ = try WireCoders.encoder().encode(decoded)
     }

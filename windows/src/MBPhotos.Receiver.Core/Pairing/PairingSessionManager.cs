@@ -47,16 +47,19 @@ public sealed class PairingSessionManager
     {
         if (request.ProtocolVersion != ProtocolConstants.Version)
         {
-            throw new ReceiverApiException(426, ErrorCodes.ProtocolMismatch, "Only protocol version 1 is supported.");
+            throw new ReceiverApiException(426, ErrorCodes.ProtocolMismatch, "Only protocol version 2 is supported. Replan the transfer for a fresh portable library.");
         }
 
         if (request.Client is null ||
             string.IsNullOrWhiteSpace(request.Client.Name) ||
+            request.Client.Name.Length > 80 ||
             string.IsNullOrWhiteSpace(request.Client.Version) ||
+            request.Client.Version.Length > 40 ||
             !Guid.TryParse(request.Client.InstanceId, out var instanceId) ||
             instanceId == Guid.Empty)
         {
-            throw new ReceiverApiException(400, ErrorCodes.InvalidRequest, "client name, version, and a non-empty UUID instanceId are required.");
+            throw new ReceiverApiException(400, ErrorCodes.InvalidRequest,
+                "client name (at most 80 characters), version (at most 40 characters), and a non-empty UUID instanceId are required.");
         }
 
         lock (sync)

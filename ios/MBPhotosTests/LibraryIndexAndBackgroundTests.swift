@@ -599,7 +599,7 @@ final class LibraryIndexAndBackgroundTests: XCTestCase {
         let planned = try ExportPlanner().plan(
             selection: frozen,
             albums: [],
-            profile: ExportProfile(kind: .preserveOriginals, preserveLocation: true)
+            profile: ExportProfile()
         )
         try await ledger.savePlannedJob(planned.job)
 
@@ -623,7 +623,7 @@ final class LibraryIndexAndBackgroundTests: XCTestCase {
         let planned = try ExportPlanner().plan(
             selection: frozen,
             albums: [],
-            profile: ExportProfile(kind: .preserveOriginals, preserveLocation: true)
+            profile: ExportProfile()
         )
         try await ledger.savePlannedJob(planned.job)
 
@@ -648,17 +648,23 @@ final class LibraryIndexAndBackgroundTests: XCTestCase {
             completedAt: checkpointedAt.addingTimeInterval(1),
             counts: CompletionCounts(
                 assetsPlanned: planned.job.assets.count,
+                assetsPromoted: planned.job.assets.count,
+                assetsArchiveIncomplete: 0,
                 filesPlanned: planned.job.files.count,
                 filesCommitted: planned.job.files.count,
                 filesSkipped: 0,
                 filesFailed: 0,
                 bytesTransferred: 0,
-                bytesCommitted: 0,
-                verifiedOriginalFiles: planned.job.files.count
+                bytesCommitted: 0
             ),
             failures: [],
-            reportRelativePath: "reports/completion.json",
-            manifestRelativePaths: []
+            reportRelativePath: "MB Photos Data/Reports/completion.json",
+            catalogGeneration: CatalogGeneration(
+                generationId: UUID(),
+                catalogPointerRelativePath: "MB Photos Data/Catalog/current.json",
+                assetsRelativePath: "MB Photos Data/Catalog/generations/test/assets.jsonl",
+                albumsRelativePath: "MB Photos Data/Catalog/generations/test/albums.jsonl"
+            )
         )
         let delayedCompletion = try await ledger.completeJob(report)
         let checkpointedStatus = try await ledger.history().first?.status

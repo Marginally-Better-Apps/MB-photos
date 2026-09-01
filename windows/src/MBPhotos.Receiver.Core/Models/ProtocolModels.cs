@@ -4,7 +4,7 @@ namespace MBPhotos.Receiver.Models;
 
 public static class ProtocolConstants
 {
-    public const int Version = 1;
+    public const int Version = 2;
     public const int ChunkSize = 8 * 1024 * 1024;
     public const int MaximumRelativePathLength = 239;
 }
@@ -24,28 +24,29 @@ public sealed record ReceiverCapabilities(
     int ChunkSizeBytes,
     int MaxRelativePathUtf16Units,
     int PathPolicyVersion,
+    int DestinationFormatVersion,
+    int CatalogFormatVersion,
     string HashAlgorithm,
     bool SequentialChunksRequired,
-    IReadOnlyList<string> SupportedProfiles);
+    IReadOnlyList<string> SupportedProfiles,
+    IReadOnlyList<StorageArea> SupportedStorageAreas);
 
 public sealed record DestinationInfo(
     Guid DestinationId,
     string DisplayName,
     DateTimeOffset CreatedAt,
     long FreeBytes,
-    int PathPolicyVersion);
+    int PathPolicyVersion,
+    int DestinationFormatVersion = 2);
 
 public enum ExportProfileKind
 {
-    PreserveOriginals,
-    OriginalsAndCurrentJpegs,
+    PortableLibrary,
 }
 
 public sealed record ExportProfile(
     ExportProfileKind Kind,
-    int ProfileVersion,
-    bool PreserveLocation,
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? JpegRendererVersion = null);
+    int ProfileVersion);
 
 public enum SelectionKind
 {
@@ -78,33 +79,74 @@ public sealed record AssetLocation(
     double Longitude,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] double? AltitudeMeters = null);
 
-public enum ExportFileKind
+public enum StorageArea
 {
-    OriginalResource,
-    CurrentJpeg,
+    Master,
+    LibraryData,
 }
 
-public enum ResourceType
+public enum RepresentationRole
 {
-    Photo,
-    Video,
-    AlternatePhoto,
-    PairedVideo,
-    Audio,
+    MasterCurrent,
+    RootOriginal,
+    CurrentLiveMotion,
+    OriginalLiveMotion,
+    AdjustmentBase,
+    AdjustmentRecipe,
+    AlternateOriginal,
+    Auxiliary,
+}
+
+public enum Criticality
+{
+    MasterRequired,
+    ArchiveRequired,
+    Optional,
+}
+
+public enum Provenance
+{
+    ExactPhotoKitResource,
+    GeneratedThumbnail,
+}
+
+public enum Availability
+{
+    Available,
+    SourceUnavailable,
+    TransferFailed,
+    Missing,
+    Tampered,
+    Superseded,
 }
 
 public sealed record ExportFile(
     Guid FileId,
     Guid AssetId,
-    ExportFileKind Kind,
-    ResourceType ResourceType,
+    string ContentRevision,
+    StorageArea StorageArea,
+    IReadOnlyList<RepresentationRole> Roles,
+    Criticality Criticality,
+    Provenance Provenance,
+    string? PhotoKitResourceType,
+    int? PhotoKitResourceTypeRaw,
     string OriginalFilename,
     string ProposedRelativePath,
+    string? UniformTypeIdentifier,
+    string? ContentType,
+    int? PixelWidth,
+    int? PixelHeight,
+    long? DurationMilliseconds,
     long? ByteCount,
     string? Sha256,
-    string SourceRevision,
     DateTimeOffset? CaptureDate,
-    string? ContentType);
+    Availability Availability);
+
+public sealed record LivePhotoRelationships(
+    Guid? CurrentStillFileId,
+    Guid? CurrentMotionFileId,
+    Guid? OriginalStillFileId,
+    Guid? OriginalMotionFileId);
 
 public sealed record ExportAsset(
     Guid AssetId,
@@ -117,7 +159,9 @@ public sealed record ExportAsset(
     bool IsEdited,
     RecoveryFingerprint RecoveryFingerprint,
     IReadOnlyList<ExportFile> Files,
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] AssetLocation? Location = null);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] AssetLocation? Location,
+    Guid? MasterFileId,
+    LivePhotoRelationships? LivePhotoRelationships);
 
 public sealed record AlbumMembership(
     Guid AlbumId,
@@ -213,13 +257,20 @@ public sealed record CompletionFailure(Guid FileId, string Code, string Message,
 
 public sealed record CompletionCounts(
     int AssetsPlanned,
+    int AssetsPromoted,
+    int AssetsArchiveIncomplete,
     int FilesPlanned,
     int FilesCommitted,
     int FilesSkipped,
     int FilesFailed,
     long BytesTransferred,
-    long BytesCommitted,
-    int VerifiedOriginalFiles);
+    long BytesCommitted);
+
+public sealed record CatalogGeneration(
+    Guid GenerationId,
+    string CatalogPointerRelativePath,
+    string AssetsRelativePath,
+    string AlbumsRelativePath);
 
 public sealed record CompletionReport(
     int ProtocolVersion,
@@ -231,7 +282,7 @@ public sealed record CompletionReport(
     CompletionCounts Counts,
     IReadOnlyList<CompletionFailure> Failures,
     string ReportRelativePath,
-    IReadOnlyList<string> ManifestRelativePaths);
+    CatalogGeneration CatalogGeneration);
 
 public sealed record AbandonJobRequest(
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Reason);
@@ -265,10 +316,13 @@ public static class ErrorCodes
     public const string TokenExpired = "token_expired";
     public const string TokenConsumed = "token_consumed";
     public const string ProtocolMismatch = "protocol_mismatch";
+    public const string DestinationFormatMismatch = "destination_format_mismatch";
     public const string DiskFull = "disk_full";
     public const string PathConflict = "path_conflict";
     public const string HashMismatch = "hash_mismatch";
     public const string UnavailableSource = "unavailable_source";
+    public const string MasterConflict = "master_conflict";
+    public const string ArchiveIncomplete = "archive_incomplete";
     public const string NetworkLoss = "network_loss";
     public const string ChangedDestination = "changed_destination";
     public const string InvalidRequest = "invalid_request";

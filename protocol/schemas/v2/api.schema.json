@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mbphotos.local/schemas/v2/api.schema.json",
+  "title": "MB Photos protocol v2 endpoint messages",
+  "$defs": {
+    "ClientIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "instanceId"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "instanceId": { "$ref": "models.schema.json#/$defs/Uuid" }
+      }
+    },
+    "PairRequest": {
+      "$anchor": "PairRequest",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "token", "client"],
+      "properties": {
+        "protocolVersion": { "const": 2 },
+        "token": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "client": { "$ref": "#/$defs/ClientIdentity" }
+      }
+    },
+    "PairResponse": {
+      "$anchor": "PairResponse",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "sessionToken", "receiverRunId", "destination", "capabilities"],
+      "properties": {
+        "protocolVersion": { "const": 2 },
+        "sessionToken": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "receiverRunId": { "$ref": "models.schema.json#/$defs/Uuid" },
+        "destination": { "$ref": "models.schema.json#/$defs/Destination" },
+        "capabilities": { "$ref": "models.schema.json#/$defs/Capabilities" }
+      }
+    },
+    "CreateJobRequest": {
+      "$anchor": "CreateJobRequest",
+      "$ref": "models.schema.json#/$defs/ExportJob"
+    },
+    "CreateJobResponse": {
+      "$anchor": "CreateJobResponse",
+      "$ref": "models.schema.json#/$defs/JobPlan"
+    },
+    "JobStatusResponse": {
+      "$anchor": "JobStatusResponse",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocolVersion",
+        "jobId",
+        "destination",
+        "state",
+        "decisions",
+        "committedFiles",
+        "createdAt",
+        "updatedAt",
+        "report"
+      ],
+      "properties": {
+        "protocolVersion": { "const": 2 },
+        "jobId": { "$ref": "models.schema.json#/$defs/Uuid" },
+        "destination": { "$ref": "models.schema.json#/$defs/Destination" },
+        "state": { "$ref": "models.schema.json#/$defs/JobState" },
+        "decisions": {
+          "type": "array",
+          "items": { "$ref": "models.schema.json#/$defs/FileDecision" }
+        },
+        "committedFiles": {
+          "type": "array",
+          "items": { "$ref": "models.schema.json#/$defs/FileCommitReceipt" }
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "report": {
+          "oneOf": [
+            { "$ref": "models.schema.json#/$defs/CompletionReport" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "UploadChunkResponse": {
+      "$anchor": "UploadChunkResponse",
+      "$ref": "models.schema.json#/$defs/ChunkReceipt"
+    },
+    "CommitFileRequest": {
+      "$anchor": "CommitFileRequest",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["byteCount", "sha256"],
+      "properties": {
+        "byteCount": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "models.schema.json#/$defs/Sha256" }
+      }
+    },
+    "CommitFileResponse": {
+      "$anchor": "CommitFileResponse",
+      "$ref": "models.schema.json#/$defs/FileCommitReceipt"
+    },
+    "CompleteJobRequest": {
+      "$anchor": "CompleteJobRequest",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["completedAt"],
+      "properties": {
+        "completedAt": { "type": "string", "format": "date-time" },
+        "failures": {
+          "type": "array",
+          "default": [],
+          "uniqueItems": true,
+          "items": { "$ref": "models.schema.json#/$defs/CompletionFailure" }
+        }
+      }
+    },
+    "CompleteJobResponse": {
+      "$anchor": "CompleteJobResponse",
+      "$ref": "models.schema.json#/$defs/CompletionReport"
+    },
+    "AbandonJobRequest": {
+      "$anchor": "AbandonJobRequest",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": ["userDiscarded", "sourceUnavailable", "clientReset", "protocolUpgradeRequired"]
+        }
+      }
+    },
+    "AbandonJobResponse": {
+      "$anchor": "AbandonJobResponse",
+      "$ref": "models.schema.json#/$defs/AbandonmentReceipt"
+    },
+    "ErrorResponse": {
+      "$anchor": "ErrorResponse",
+      "$ref": "models.schema.json#/$defs/ApiError"
+    }
+  }
+}

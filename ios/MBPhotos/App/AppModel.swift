@@ -20,6 +20,33 @@ enum AppStartupState: Equatable {
     case failed(String)
 }
 
+@MainActor
+final class TransferPreferences {
+    init(defaults: UserDefaults = .standard) {}
+
+    var profileKind: ExportProfileKind {
+        get { .portableLibrary }
+        set {}
+    }
+}
+
+enum TransferPresentationPolicy {
+    static func clearsQuickSelection(after phase: ExportPhase) -> Bool {
+        phase == .completed
+    }
+
+    static func shouldInvalidatePreparedTransferForConnection(
+        preparedJobID: UUID?,
+        frozenResumeJobID: UUID?,
+        isPlanning: Bool,
+        hasPendingPreflight: Bool
+    ) -> Bool {
+        let preservesFrozenResume = preparedJobID != nil && preparedJobID == frozenResumeJobID
+        return !preservesFrozenResume
+            && (preparedJobID != nil || isPlanning || hasPendingPreflight)
+    }
+}
+
 /// A synchronous MainActor fence for scene callbacks. Async work captures the
 /// returned generation and must revalidate it after every suspension point.
 @MainActor
@@ -99,13 +126,14 @@ final class AppModel: ObservableObject {
     @Published private(set) var assets: [PhotoAsset] = []
     @Published private(set) var albums: [PhotoAlbum] = []
     @Published private(set) var isLoadingLibrary = false
-    @Published var selectionKind: SelectionKind = .allAccessible {
+    @Published var selectionKind: SelectionKind = .manual {
         didSet {
             if oldValue != selectionKind { invalidatePreflight() }
         }
     }
     @Published private(set) var selectedAssetIDs: Set<String> = []
     @Published private(set) var selectedAlbumIDs: Set<String> = []
+    @Published private(set) var selectionPreviewAssets: [PhotoAsset] = []
     @Published var rangeStart = Calendar.current.date(byAdding: .month, value: -1, to: Date()) ?? Date() {
         didSet {
             if oldValue != rangeStart { invalidatePreflight() }
@@ -116,16 +144,7 @@ final class AppModel: ObservableObject {
             if oldValue != rangeEnd { invalidatePreflight() }
         }
     }
-    @Published var profileKind: ExportProfileKind = .preserveOriginals {
-        didSet {
-            if oldValue != profileKind { invalidatePreflight() }
-        }
-    }
-    @Published var preserveLocation = true {
-        didSet {
-            if oldValue != preserveLocation { invalidatePreflight() }
-        }
-    }
+    @Published private(set) var profileKind: ExportProfileKind = .portableLibrary
     @Published private(set) var plannedExport: PlannedExport?
     @Published private(set) var isPlanning = false
     @Published private(set) var history: [ExportHistoryEntry] = []
@@ -149,6 +168,7 @@ final class AppModel: ObservableObject {
     }
 
     private let preflightWorker = PreflightWorker()
+    private let transferPreferences: TransferPreferences
     private var organizeCoordinator: OrganizeCoordinator?
     private var libraryIndexWorker: LibraryIndexWorker?
     private var stagingStore: StagedRenditionStore?
@@ -164,6 +184,7 @@ final class AppModel: ObservableObject {
     private var preflightTask: Task<Void, Never>?
     private var selectionRevision: UInt64 = 0
     private var selectionMutationTask: Task<Void, Never>?
+    private var frozenResumeJobID: UUID?
     private let sceneTransitionFence = SceneTransitionGenerationFence()
     private var sceneTransitionTask: Task<Void, Never>?
     private var backgroundConstraintTask: Task<Void, Never>?
@@ -173,8 +194,13 @@ final class AppModel: ObservableObject {
         return message
     }
 
-    init(diagnostics: CrashLogStore = .shared) {
+    init(
+        diagnostics: CrashLogStore = .shared,
+        transferPreferences: TransferPreferences = TransferPreferences()
+    ) {
         self.diagnostics = diagnostics
+        self.transferPreferences = transferPreferences
+        profileKind = transferPreferences.profileKind
         let catalog = PhotoKitCatalog()
         self.catalog = catalog
         let initialAuthorization = catalog.authorizationState()
@@ -239,6 +265,7 @@ final class AppModel: ObservableObject {
             // Authorization transitions are privacy boundaries. Never keep an
             // authorized snapshot—or a previously valid limited scope—visible
             // while the current scope fingerprint is being validated.
+            clearSelectedItems()
             replaceLibraryPresentation(assets: [], albums: [])
             lastCatalogRevision = nil
             await organizeCoordinator?.refresh(
@@ -316,7 +343,12 @@ final class AppModel: ObservableObject {
         diagnostics.record(.info, category: "Receiver", message: "Pairing started")
         do {
             let payload = try PairingPayload(string: pairingText)
-            if plannedExport != nil || isPlanning || coordinator.hasPendingPreflight {
+            if TransferPresentationPolicy.shouldInvalidatePreparedTransferForConnection(
+                preparedJobID: plannedExport?.job.jobId,
+                frozenResumeJobID: frozenResumeJobID,
+                isPlanning: isPlanning,
+                hasPendingPreflight: coordinator.hasPendingPreflight
+            ) {
                 invalidatePreflight()
                 await preflightTask?.value
             }
@@ -379,8 +411,8 @@ final class AppModel: ObservableObject {
         // synchronously. Do not submit a background continuation if another
         // state check caused the foreground start to be rejected.
         guard coordinator.isRunning else { return }
-        let fileCount = plannedExport.preflight.originalFileCount
-            + plannedExport.preflight.generatedJPEGCount
+        frozenResumeJobID = nil
+        let fileCount = plannedExport.job.files.count
         let jobID = plannedExport.job.jobId
         let continuedOutcome = BackgroundWorkController.shared.beginUserInitiatedExport(
             jobID: jobID,
@@ -398,6 +430,7 @@ final class AppModel: ObservableObject {
 
     func invalidatePreflight() {
         guard plannedExport != nil || isPlanning || coordinator?.hasPendingPreflight == true else { return }
+        frozenResumeJobID = nil
         preflightRevision &+= 1
         let revision = preflightRevision
         let previous = preflightTask
@@ -415,49 +448,123 @@ final class AppModel: ObservableObject {
     }
 
     func toggleSelectedAssetID(_ id: String) {
-        let isSelected: Bool
-        if selectedAssetIDs.contains(id) {
-            selectedAssetIDs.remove(id)
-            isSelected = false
+        setSelectedAssetID(id, isSelected: !selectedAssetIDs.contains(id))
+    }
+
+    func setSelectedAssetID(_ id: String, isSelected: Bool) {
+        applyAssetSelection([id], isSelected: isSelected)
+    }
+
+    func setSelectedAssetIDs(_ ids: [String], isSelected: Bool) {
+        applyAssetSelection(ids, isSelected: isSelected)
+    }
+
+    func setAllAssetsSelected(_ isSelected: Bool) {
+        let changedIDs: [String]
+        if isSelected {
+            changedIDs = assets.lazy
+                .map(\.id)
+                .filter { !selectedAssetIDs.contains($0) }
         } else {
-            selectedAssetIDs.insert(id)
-            isSelected = true
+            changedIDs = Array(selectedAssetIDs)
+        }
+        applyAssetSelection(changedIDs, isSelected: isSelected)
+    }
+
+    private func applyAssetSelection(_ ids: [String], isSelected: Bool) {
+        let changedIDs = ids.filter { selectedAssetIDs.contains($0) != isSelected }
+        guard !changedIDs.isEmpty else { return }
+        if selectionKind != .manual { selectionKind = .manual }
+        if isSelected {
+            selectedAssetIDs.formUnion(changedIDs)
+        } else {
+            selectedAssetIDs.subtract(changedIDs)
         }
         selectionRevision &+= 1
-        enqueueSelectionDelta(
-            .asset(revision: selectionRevision, id: id, isSelected: isSelected)
-        )
+        if changedIDs.count == 1, let id = changedIDs.first {
+            enqueueSelectionDelta(
+                .asset(revision: selectionRevision, id: id, isSelected: isSelected)
+            )
+        } else {
+            enqueueSelectionDelta(
+                .assets(revision: selectionRevision, ids: changedIDs, isSelected: isSelected)
+            )
+        }
+        refreshSelectionPreviews()
         invalidatePreflight()
     }
 
     func toggleSelectedAlbumID(_ id: String) {
-        let isSelected: Bool
-        if selectedAlbumIDs.contains(id) {
-            selectedAlbumIDs.remove(id)
-            isSelected = false
+        setSelectedAlbumID(id, isSelected: !selectedAlbumIDs.contains(id))
+    }
+
+    func setSelectedAlbumID(_ id: String, isSelected: Bool) {
+        applyAlbumSelection([id], isSelected: isSelected)
+    }
+
+    func setAllAlbumsSelected(_ isSelected: Bool) {
+        let changedIDs: [String]
+        if isSelected {
+            changedIDs = albums.lazy
+                .map(\.id)
+                .filter { !selectedAlbumIDs.contains($0) }
         } else {
-            selectedAlbumIDs.insert(id)
-            isSelected = true
+            changedIDs = Array(selectedAlbumIDs)
+        }
+        applyAlbumSelection(changedIDs, isSelected: isSelected)
+    }
+
+    private func applyAlbumSelection(_ ids: [String], isSelected: Bool) {
+        let changedIDs = ids.filter { selectedAlbumIDs.contains($0) != isSelected }
+        guard !changedIDs.isEmpty else { return }
+        if selectionKind != .manual { selectionKind = .manual }
+        if isSelected {
+            selectedAlbumIDs.formUnion(changedIDs)
+        } else {
+            selectedAlbumIDs.subtract(changedIDs)
         }
         selectionRevision &+= 1
-        enqueueSelectionDelta(
-            .album(revision: selectionRevision, id: id, isSelected: isSelected)
-        )
+        if changedIDs.count == 1, let id = changedIDs.first {
+            enqueueSelectionDelta(
+                .album(revision: selectionRevision, id: id, isSelected: isSelected)
+            )
+        } else {
+            enqueueSelectionDelta(
+                .albums(revision: selectionRevision, ids: changedIDs, isSelected: isSelected)
+            )
+        }
+        refreshSelectionPreviews()
         invalidatePreflight()
     }
 
-    func loadResume(jobID: UUID) async {
-        guard let ledger else { return }
+    func clearSelectedItems() {
+        guard !selectedAssetIDs.isEmpty || !selectedAlbumIDs.isEmpty else { return }
+        selectedAssetIDs.removeAll(keepingCapacity: false)
+        selectedAlbumIDs.removeAll(keepingCapacity: false)
+        selectionPreviewAssets.removeAll(keepingCapacity: false)
+        selectionRevision &+= 1
+        enqueueSelectionDelta(.clear(revision: selectionRevision))
+        invalidatePreflight()
+    }
+
+    @discardableResult
+    func loadResume(jobID: UUID) async -> Bool {
+        guard let ledger else { return false }
         do {
             await refreshLibrary(force: true)
             let job = try await ledger.loadJob(jobID)
             replacePlannedExport(with: try await preflightWorker.rehydrate(job: job, assets: assets))
-            alertMessage = "The frozen export is ready. Scan the current Windows receiver QR code, then resume from the Export tab."
+            frozenResumeJobID = jobID
+            alertMessage = coordinator?.isConnected == true
+                ? "The frozen transfer is ready to review on Home."
+                : "The frozen transfer is ready. Connect to the current Windows receiver, then review it on Home."
+            return true
         } catch is CancellationError {
-            return
+            return false
         } catch {
             diagnostics.record(error: error, category: "Export Resume")
             alertMessage = error.localizedDescription
+            return false
         }
     }
 
@@ -1021,8 +1128,9 @@ final class AppModel: ObservableObject {
                 message: "Export review completed",
                 metadata: [
                     "assets": String(reconciled.preflight.assetCount),
-                    "originalFiles": String(reconciled.preflight.originalFileCount),
-                    "generatedJPEGs": String(reconciled.preflight.generatedJPEGCount)
+                    "masterFiles": String(reconciled.preflight.masterFileCount),
+                    "archiveFiles": String(reconciled.preflight.archiveFileCount),
+                    "thumbnails": String(reconciled.preflight.thumbnailFileCount)
                 ]
             )
             PresentationStorageRetirement.retire(consume reconciled)
@@ -1063,6 +1171,7 @@ final class AppModel: ObservableObject {
         let previous = LibraryPresentationStorage(assets: assets, albums: albums)
         assets = replacementAssets
         albums = replacementAlbums
+        refreshSelectionPreviews()
         libraryPresentationRevision &+= 1
         if !previous.isEmpty {
             PresentationStorageRetirement.retire(consume previous)
@@ -1101,7 +1210,7 @@ final class AppModel: ObservableObject {
             kind: selectionKind,
             rangeStart: start,
             rangeEnd: nextDay.addingTimeInterval(-0.001),
-            profile: ExportProfile(kind: profileKind, preserveLocation: preserveLocation)
+            profile: ExportProfile()
         )
     }
 
@@ -1125,6 +1234,29 @@ final class AppModel: ObservableObject {
             await worker.applySelectionDelta(delta)
         }
         selectionMutationTask = operation
+    }
+
+    private func refreshSelectionPreviews() {
+        var candidateIDs: [String] = []
+        var seen: Set<String> = []
+
+        for id in selectedAssetIDs where seen.insert(id).inserted {
+            candidateIDs.append(id)
+            if candidateIDs.count == 3 { break }
+        }
+        if candidateIDs.count < 3 {
+            for album in albums where selectedAlbumIDs.contains(album.id) {
+                for id in album.assetIDs where seen.insert(id).inserted {
+                    candidateIDs.append(id)
+                    if candidateIDs.count == 3 { break }
+                }
+                if candidateIDs.count == 3 { break }
+            }
+        }
+
+        selectionPreviewAssets = candidateIDs.compactMap { id in
+            assets.first(where: { $0.id == id })
+        }
     }
 }
 

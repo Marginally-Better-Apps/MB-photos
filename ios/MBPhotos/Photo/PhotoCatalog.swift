@@ -168,7 +168,9 @@ enum PhotoKitAssetMapper {
             modificationDate: asset.modificationDate,
             pixelWidth: asset.pixelWidth,
             pixelHeight: asset.pixelHeight,
-            durationMilliseconds: asset.mediaType == .video ? Int(asset.duration * 1_000) : nil,
+            durationMilliseconds: asset.mediaType == .video || asset.mediaSubtypes.contains(.photoLive)
+                ? Int(asset.duration * 1_000)
+                : nil,
             location: asset.location.map {
                 AssetLocation(
                     latitude: $0.coordinate.latitude,
@@ -258,8 +260,11 @@ enum PhotoKitResourceCatalog {
                 PhotoResourceDescriptor(
                     id: "\(assetID)#\(keyHash)#\(occurrence)",
                     kind: mapResourceKind(entry.resource.type),
+                    rawResourceType: entry.resource.type.rawValue,
                     originalFilename: entry.resource.originalFilename,
-                    uniformTypeIdentifier: entry.resource.uniformTypeIdentifier
+                    uniformTypeIdentifier: entry.resource.uniformTypeIdentifier,
+                    pixelWidth: entry.resource.pixelWidth,
+                    pixelHeight: entry.resource.pixelHeight
                 ),
                 entry.resource
             ))

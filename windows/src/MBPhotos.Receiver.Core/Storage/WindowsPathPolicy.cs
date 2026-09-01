@@ -6,7 +6,7 @@ namespace MBPhotos.Receiver.Storage;
 
 public sealed class WindowsPathPolicy
 {
-    public const int Version = 1;
+    public const int Version = 2;
 
     private static readonly HashSet<string> ReservedNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -41,11 +41,24 @@ public sealed class WindowsPathPolicy
     }
 
     public string CreateDefaultRelativePath(DateTimeOffset? captureDate, string originalName, Guid fileId)
+        => CreateDefaultRelativePath(captureDate, originalName, fileId, StorageArea.Master, null);
+
+    public string CreateDefaultRelativePath(
+        DateTimeOffset? captureDate,
+        string originalName,
+        Guid fileId,
+        StorageArea storageArea,
+        Guid? assetId,
+        Provenance provenance = Provenance.ExactPhotoKitResource)
     {
         var timestamp = captureDate ?? DateTimeOffset.UnixEpoch;
         var safeName = SanitizeFileName(originalName, fileId);
-        var path = FormattableString.Invariant(
-            $"Photos/{timestamp:yyyy}/{timestamp:yyyy-MM}/{timestamp:yyyy-MM-dd}/{safeName}");
+        var path = storageArea == StorageArea.Master
+            ? FormattableString.Invariant(
+                $"Master/{timestamp:yyyy}/{timestamp:yyyy-MM}/{timestamp:yyyy-MM-dd}/{safeName}")
+            : provenance == Provenance.GeneratedThumbnail
+                ? $"MB Photos Data/Thumbnails/{(assetId ?? Guid.Empty):D}/{fileId:D}{Path.GetExtension(safeName)}"
+                : $"MB Photos Data/Resources/{(assetId ?? Guid.Empty):D}/{fileId:D}{Path.GetExtension(safeName)}";
         return ShortenRelativePath(path, fileId);
     }
 
@@ -53,9 +66,25 @@ public sealed class WindowsPathPolicy
         string? proposedPath,
         DateTimeOffset? captureDate,
         string originalName,
-        Guid fileId)
+        Guid fileId) => NormalizeProposedPath(
+            proposedPath,
+            captureDate,
+            originalName,
+            fileId,
+            StorageArea.Master,
+            null,
+            Provenance.ExactPhotoKitResource);
+
+    public string NormalizeProposedPath(
+        string? proposedPath,
+        DateTimeOffset? captureDate,
+        string originalName,
+        Guid fileId,
+        StorageArea storageArea,
+        Guid? assetId,
+        Provenance provenance)
     {
-        var fallback = CreateDefaultRelativePath(captureDate, originalName, fileId);
+        var fallback = CreateDefaultRelativePath(captureDate, originalName, fileId, storageArea, assetId, provenance);
         if (string.IsNullOrWhiteSpace(proposedPath))
         {
             return fallback;
@@ -76,9 +105,18 @@ public sealed class WindowsPathPolicy
             throw new ReceiverApiException(400, ErrorCodes.UnsafePath, "The proposed path contains an unsafe segment.");
         }
 
-        if (!string.Equals(rawSegments[0], "Photos", StringComparison.Ordinal))
+        var validArea = storageArea == StorageArea.Master
+            ? rawSegments.Length >= 2 && string.Equals(rawSegments[0], "Master", StringComparison.Ordinal)
+            : rawSegments.Length >= 3 &&
+                string.Equals(rawSegments[0], "MB Photos Data", StringComparison.Ordinal) &&
+                ((provenance == Provenance.GeneratedThumbnail && string.Equals(rawSegments[1], "Thumbnails", StringComparison.Ordinal)) ||
+                 (provenance != Provenance.GeneratedThumbnail && string.Equals(rawSegments[1], "Resources", StringComparison.Ordinal)));
+        if (!validArea)
         {
-            throw new ReceiverApiException(400, ErrorCodes.UnsafePath, "Exported media must be written below the Photos directory.");
+            throw new ReceiverApiException(400, ErrorCodes.UnsafePath,
+                storageArea == StorageArea.Master
+                    ? "Master media must be written below the Master directory."
+                    : "Support resources must be written below the receiver-owned Resources or Thumbnails directory.");
         }
 
         var safeSegments = new List<string>(rawSegments.Length);

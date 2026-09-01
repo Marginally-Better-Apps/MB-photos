@@ -1,0 +1,6 @@
+{
+  "code": "destination_format_mismatch",
+  "message": "This is a v1 destination. Choose an empty folder to create a portable library.",
+  "retryable": false,
+  "requestId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+}

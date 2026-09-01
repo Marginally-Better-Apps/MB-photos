@@ -32,7 +32,7 @@ targets:
         LSRequiresIPhoneOS: true
         NSCameraUsageDescription: Scan the one-time code shown by the MB Photos Windows receiver. Camera images are not stored.
         NSLocalNetworkUsageDescription: Transfer your selected photos directly to your Windows PC over your private local network.
-        NSPhotoLibraryUsageDescription: Read and organize your photos and videos. Items you explicitly confirm for removal are moved to Apple Photos’ Recently Deleted collection.
+        NSPhotoLibraryUsageDescription: Select photos and videos to transfer to your Windows PC. Optional organize actions move only items you confirm to Recently Deleted.
         PHPhotoLibraryPreventAutomaticLimitedAccessAlert: true
         BGTaskSchedulerPermittedIdentifiers:
           - com.marginallybetter.photos.refresh

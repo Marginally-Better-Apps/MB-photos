@@ -721,7 +721,7 @@ enum OrganizeStorageAnalysisBucketID: String, CaseIterable, Hashable, Sendable {
         albumIDs: [String]
     ) -> [OrganizeStorageAnalysisBucketID] {
         var result: [OrganizeStorageAnalysisBucketID] = []
-        if asset.mediaKind == .photo && !asset.mediaSubtypes.contains(.screenshot) {
+        if asset.mediaKind == .photo {
             result.append(.photos)
         }
         if asset.mediaSubtypes.contains(.screenshot) { result.append(.screenshots) }
@@ -3751,15 +3751,15 @@ private enum OrganizePresentationBuilder {
         visualRecommendations: VisualRecommendationResult,
         referenceDate: Date
     ) -> DerivedPresentation {
-        let regularPhotos = assets.filter { $0.mediaKind == .photo && !$0.isScreenshot }
+        let photos = assets.filter { $0.mediaKind == .photo }
         let screenshots = assets.filter(\.isScreenshot)
         let videos = assets.filter { $0.mediaKind == .video }
         let primary = [
-            metric("photos", "Photos", "photo", regularPhotos, .blue, false),
-            metric("screenshots", "Screenshots", "rectangle.inset.filled.and.person.filled", screenshots, .purple, false),
+            metric("photos", "Photos", "photo", photos, .blue, false),
             metric("videos", "Videos", "video", videos, .orange, false)
         ]
         let secondary = [
+            metric("screenshots", "Screenshots", "rectangle.inset.filled.and.person.filled", screenshots, .purple, true),
             metric("live", "Live Photos", "livephoto", assets.filter(\.isLivePhoto), .purple, true),
             metric("raw", "RAW", "camera.aperture", assets.filter(\.isRAW), .gray, true),
             metric("favorites", "Favorites", "heart.fill", assets.filter(\.isFavorite), .orange, true),

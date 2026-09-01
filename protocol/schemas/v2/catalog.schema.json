@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mbphotos.local/schemas/v2/catalog.schema.json",
+  "title": "MB Photos portable library catalog v2",
+  "$defs": {
+    "LibraryDescriptor": {
+      "$anchor": "LibraryDescriptor",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "libraryFormatVersion",
+        "destinationId",
+        "createdAt",
+        "masterRelativePath",
+        "dataRelativePath",
+        "catalogPointerRelativePath"
+      ],
+      "properties": {
+        "libraryFormatVersion": { "const": 2 },
+        "destinationId": { "$ref": "models.schema.json#/$defs/Uuid" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "masterRelativePath": { "const": "Master" },
+        "dataRelativePath": { "const": "MB Photos Data" },
+        "catalogPointerRelativePath": { "const": "MB Photos Data/Catalog/current.json" }
+      }
+    },
+    "CatalogPointer": {
+      "$anchor": "CatalogPointer",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "catalogFormatVersion",
+        "generationId",
+        "generatedAt",
+        "assetsRelativePath",
+        "albumsRelativePath"
+      ],
+      "properties": {
+        "catalogFormatVersion": { "const": 2 },
+        "generationId": { "$ref": "models.schema.json#/$defs/Uuid" },
+        "generatedAt": { "type": "string", "format": "date-time" },
+        "assetsRelativePath": {
+          "type": "string",
+          "pattern": "^MB Photos Data/Catalog/generations/[0-9a-fA-F-]{36}/assets\\.jsonl$",
+          "maxLength": 239
+        },
+        "albumsRelativePath": {
+          "type": "string",
+          "pattern": "^MB Photos Data/Catalog/generations/[0-9a-fA-F-]{36}/albums\\.jsonl$",
+          "maxLength": 239
+        }
+      }
+    },
+    "CatalogFile": {
+      "$anchor": "CatalogFile",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fileId",
+        "contentRevision",
+        "storageArea",
+        "roles",
+        "criticality",
+        "provenance",
+        "photoKitResourceType",
+        "photoKitResourceTypeRaw",
+        "originalFilename",
+        "uniformTypeIdentifier",
+        "contentType",
+        "pixelWidth",
+        "pixelHeight",
+        "durationMilliseconds",
+        "byteCount",
+        "sha256",
+        "captureDate",
+        "acceptedRelativePath",
+        "availability"
+      ],
+      "properties": {
+        "fileId": { "$ref": "models.schema.json#/$defs/Uuid" },
+        "contentRevision": { "$ref": "models.schema.json#/$defs/Sha256" },
+        "storageArea": { "$ref": "models.schema.json#/$defs/StorageArea" },
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "models.schema.json#/$defs/RepresentationRole" }
+        },
+        "criticality": { "$ref": "models.schema.json#/$defs/Criticality" },
+        "provenance": { "$ref": "models.schema.json#/$defs/Provenance" },
+        "photoKitResourceType": { "$ref": "models.schema.json#/$defs/NullablePhotoKitResourceType" },
+        "photoKitResourceTypeRaw": { "$ref": "models.schema.json#/$defs/NullableNonNegativeInteger" },
+        "originalFilename": { "type": "string", "minLength": 1 },
+        "uniformTypeIdentifier": { "$ref": "models.schema.json#/$defs/NullableString" },
+        "contentType": { "$ref": "models.schema.json#/$defs/NullableContentType" },
+        "pixelWidth": { "$ref": "models.schema.json#/$defs/NullableNonNegativeInteger" },
+        "pixelHeight": { "$ref": "models.schema.json#/$defs/NullableNonNegativeInteger" },
+        "durationMilliseconds": { "$ref": "models.schema.json#/$defs/NullableNonNegativeInteger" },
+        "byteCount": { "$ref": "models.schema.json#/$defs/NullableNonNegativeInteger" },
+        "sha256": { "$ref": "models.schema.json#/$defs/NullableSha256" },
+        "captureDate": { "$ref": "models.schema.json#/$defs/NullableDateTime" },
+        "acceptedRelativePath": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 239 },
+            { "type": "null" }
+          ]
+        },
+        "availability": { "$ref": "models.schema.json#/$defs/Availability" }
+      }
+    },
+    "CatalogAsset": {
+      "$anchor": "CatalogAsset",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "catalogFormatVersion",
+        "assetId",
+        "sourceLocalIdentifier",
+        "sourceRevision",
+        "mediaType",
+        "mediaSubtypes",
+        "creationDate",
+        "modificationDate",
+        "isEdited",
+        "masterFileId",
+        "livePhotoRelationships",
+        "archiveState",
+        "files"
+      ],
+      "properties": {
+        "catalogFormatVersion": { "const": 2 },
+        "assetId": { "$ref": "models.schema.json#/$defs/Uuid" },
+        "sourceLocalIdentifier": { "type": "string", "minLength": 1 },
+        "sourceRevision": { "$ref": "models.schema.json#/$defs/Sha256" },
+        "mediaType": { "$ref": "models.schema.json#/$defs/MediaType" },
+        "mediaSubtypes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "creationDate": { "$ref": "models.schema.json#/$defs/NullableDateTime" },
+        "modificationDate": { "$ref": "models.schema.json#/$defs/NullableDateTime" },
+        "location": { "$ref": "models.schema.json#/$defs/AssetLocation" },
+        "isEdited": { "type": "boolean" },
+        "masterFileId": { "$ref": "models.schema.json#/$defs/NullableUuid" },
+        "livePhotoRelationships": {
+          "oneOf": [
+            { "$ref": "models.schema.json#/$defs/LivePhotoRelationships" },
+            { "type": "null" }
+          ]
+        },
+        "archiveState": { "$ref": "models.schema.json#/$defs/ArchiveState" },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/CatalogFile" }
+        }
+      }
+    },
+    "CatalogAlbumMembership": {
+      "$anchor": "CatalogAlbumMembership",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "catalogFormatVersion",
+        "albumId",
+        "sourceAlbumIdentifier",
+        "albumTitle",
+        "parentAlbumId",
+        "assetId"
+      ],
+      "properties": {
+        "catalogFormatVersion": { "const": 2 },
+        "albumId": { "$ref": "models.schema.json#/$defs/Uuid" },
+        "sourceAlbumIdentifier": { "type": "string", "minLength": 1 },
+        "albumTitle": { "type": "string", "minLength": 1 },
+        "parentAlbumId": { "$ref": "models.schema.json#/$defs/NullableUuid" },
+        "assetId": { "$ref": "models.schema.json#/$defs/Uuid" }
+      }
+    }
+  }
+}

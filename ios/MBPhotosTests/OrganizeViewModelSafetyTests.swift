@@ -81,6 +81,22 @@ final class OrganizeViewModelSafetyTests: XCTestCase {
         XCTAssertEqual(presented.map(\.id), ["edited", "live", "favorites"])
     }
 
+    func testScreenshotsAppearInDetailedBreakdownAndPhotoTotal() async {
+        let model = await makeModel(assets: [
+            asset(id: "screenshot", subtypes: [.screenshot]),
+            asset(id: "regular-photo")
+        ])
+
+        let photos = model.primaryBreakdown.first { $0.id == "photos" }
+        let screenshots = model.primaryBreakdown.first { $0.id == "screenshots" }
+        let detailedScreenshots = model.secondaryBreakdown.first { $0.id == "screenshots" }
+
+        XCTAssertEqual(photos?.itemCount, 2)
+        XCTAssertNil(screenshots)
+        XCTAssertEqual(detailedScreenshots?.itemCount, 1)
+        XCTAssertTrue(detailedScreenshots?.overlapsPrimaryCategories == true)
+    }
+
     func testAbsoluteAnalysisProgressUpdatesSmallStoragePresentationInPlace() async {
         let model = await makeModel(assets: [
             asset(

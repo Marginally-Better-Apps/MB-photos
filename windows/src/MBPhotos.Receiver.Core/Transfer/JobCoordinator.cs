@@ -15,6 +15,9 @@ public sealed class JobCoordinator
     private readonly WindowsPathPolicy pathPolicy;
     private readonly FileTransferService transfers;
     private readonly ManifestWriter manifestWriter;
+    private readonly MasterPromotionService masterPromotion;
+    private readonly RepresentationReuseService representationReuse;
+    private readonly SupersededRepresentationService supersededRepresentations;
     private readonly JsonSerializerOptions jsonOptions;
     private readonly SemaphoreSlim planningGate = new(1, 1);
     private readonly SemaphoreSlim observerExclusion = new(1, 1);
@@ -29,6 +32,9 @@ public sealed class JobCoordinator
         WindowsPathPolicy pathPolicy,
         FileTransferService transfers,
         ManifestWriter manifestWriter,
+        MasterPromotionService masterPromotion,
+        RepresentationReuseService representationReuse,
+        SupersededRepresentationService supersededRepresentations,
         JsonSerializerOptions jsonOptions)
     {
         this.destination = destination;
@@ -37,6 +43,9 @@ public sealed class JobCoordinator
         this.pathPolicy = pathPolicy;
         this.transfers = transfers;
         this.manifestWriter = manifestWriter;
+        this.masterPromotion = masterPromotion;
+        this.representationReuse = representationReuse;
+        this.supersededRepresentations = supersededRepresentations;
         this.jsonOptions = jsonOptions;
     }
 
@@ -87,11 +96,11 @@ public sealed class JobCoordinator
 
             var acceptedPaths = new Dictionary<Guid, string>();
             var proposedPaths = new Dictionary<Guid, string>();
-            var priorSkips = new Dictionary<Guid, (LedgerFile Prior, long ObservedTicks)>();
+            var priorSkips = new Dictionary<Guid, (LedgerFile Prior, long ObservedTicks, bool Reuse)>();
             var reservedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var manifestFiles = job.Assets.SelectMany(static asset => asset.Files).ToArray();
             var priorFiles = await ledger.FindPriorCommittedAsync(
-                manifestFiles.Select(static file => (file.FileId, file.SourceRevision)).ToArray(),
+                manifestFiles.Select(static file => (file.FileId, file.ContentRevision)).ToArray(),
                 cancellationToken);
             foreach (var asset in job.Assets)
             {
@@ -101,18 +110,28 @@ public sealed class JobCoordinator
                         file.ProposedRelativePath,
                         file.CaptureDate,
                         file.OriginalFilename,
-                        file.FileId);
+                        file.FileId,
+                        file.StorageArea,
+                        file.AssetId,
+                        file.Provenance);
                     proposedPaths[file.FileId] = proposed;
-                    priorFiles.TryGetValue((file.FileId, file.SourceRevision), out var prior);
+                    priorFiles.TryGetValue((file.FileId, file.ContentRevision), out var prior);
                     if (prior is not null &&
-                        prior.Kind == file.Kind &&
-                        string.Equals(prior.ProposedPath, proposed, StringComparison.OrdinalIgnoreCase) &&
                         (file.ByteCount is null || file.ByteCount == prior.CommittedBytes) &&
                         await ValidatePriorAsync(prior, cancellationToken) is { } observedTicks)
                     {
-                        acceptedPaths[file.FileId] = prior.RelativePath;
-                        priorSkips[file.FileId] = (prior, observedTicks);
-                        reservedPaths.Add(prior.RelativePath);
+                        var samePlacement =
+                            prior.StorageArea == file.StorageArea &&
+                            prior.Roles.SequenceEqual(file.Roles) &&
+                            prior.Criticality == file.Criticality &&
+                            prior.Provenance == file.Provenance &&
+                            string.Equals(prior.ProposedPath, proposed, StringComparison.OrdinalIgnoreCase);
+                        var reusedAccepted = samePlacement
+                            ? prior.RelativePath
+                            : AllocatePath(proposed, file.FileId, reservedPaths);
+                        acceptedPaths[file.FileId] = reusedAccepted;
+                        priorSkips[file.FileId] = (prior, observedTicks, !samePlacement);
+                        reservedPaths.Add(reusedAccepted);
                         continue;
                     }
 
@@ -124,7 +143,7 @@ public sealed class JobCoordinator
 
             var uploadBytes = job.Assets
                 .SelectMany(static asset => asset.Files)
-                .Where(file => !priorSkips.ContainsKey(file.FileId))
+                .Where(file => file.Availability == Availability.Available && !priorSkips.ContainsKey(file.FileId))
                 .Sum(static file => file.ByteCount ?? 0);
             var freeBytes = destinationManager.RefreshInfo(destination).FreeBytes;
             if (freeBytes > 0 && uploadBytes > freeBytes)
@@ -142,7 +161,8 @@ public sealed class JobCoordinator
                 priorSkips.Select(static skip => new LedgerSkip(
                     skip.Key,
                     skip.Value.Prior,
-                    skip.Value.ObservedTicks)).ToArray(),
+                    skip.Value.ObservedTicks,
+                    skip.Value.Reuse)).ToArray(),
                 cancellationToken);
 
             PublishActivity(new ReceiverActivity(
@@ -180,6 +200,14 @@ public sealed class JobCoordinator
         var report = job.State is JobState.Completed or JobState.CompletedWithFailures
             ? await manifestWriter.ReadReportAsync(jobId, cancellationToken)
             : null;
+        if (report is not null)
+        {
+            // A crash may occur after the terminal ledger transaction but before
+            // the immutable catalog generation/current pointer is published.
+            // Never expose terminal status until that boundary is recovered.
+            await manifestWriter.EnsurePublishedAsync(report, cancellationToken);
+            await masterPromotion.CleanupSupersededAsync(cancellationToken);
+        }
         return new JobStatus(
             ProtocolConstants.Version,
             jobId,
@@ -298,6 +326,7 @@ public sealed class JobCoordinator
                 destinationManager.RefreshInfo(destination).FreeBytes));
             await transfers.RemoveUncommittedPartialsAsync(jobId, CancellationToken.None);
             await manifestWriter.WriteAsync(storedReport, cancellationToken);
+            await masterPromotion.CleanupSupersededAsync(cancellationToken);
             PublishActivity(new ReceiverActivity(
                 jobId,
                 storedReport.State,
@@ -344,18 +373,45 @@ public sealed class JobCoordinator
             throw new ReceiverApiException(409, ErrorCodes.JobConflict, "Every pending file must be committed, skipped, or reported as a failure.");
         }
 
+        var preflight = await masterPromotion.PreflightAsync(job, files, cancellationToken);
+        var reuseFailures = await representationReuse.PrepareAsync(
+            job,
+            files,
+            preflight.BlockedAssetIds,
+            cancellationToken);
+        files = await ledger.GetJobFilesAsync(jobId, cancellationToken);
+        var promotionFailures = await masterPromotion.PromoteAsync(job, files, cancellationToken);
+        var allFailures = failures
+            .Concat(preflight.Failures)
+            .Concat(reuseFailures)
+            .Concat(promotionFailures)
+            .ToArray();
+        files = await ledger.GetJobFilesAsync(jobId, cancellationToken);
+        await supersededRepresentations.StageCleanupAsync(job, files, cancellationToken);
         var stats = await ledger.GetStatsAsync(jobId, cancellationToken);
         var completedAt = request.CompletedAt;
-        var reportState = failures.Count == 0 ? "completed" : "completedWithFailures";
+        var reportState = allFailures.Length == 0 ? "completed" : "completedWithFailures";
+        filesById = files.ToDictionary(static file => file.FileId);
+        var assetsPromoted = job.Assets.Count(asset =>
+            asset.MasterFileId is { } masterId &&
+            filesById.TryGetValue(masterId, out var master) &&
+            master.State is "committed" or "skipped");
+        var assetsArchiveIncomplete = job.Assets.Count(asset => asset.Files.Any(manifestFile =>
+            manifestFile.Criticality == Criticality.ArchiveRequired &&
+            (!filesById.TryGetValue(manifestFile.FileId, out var stored) ||
+             stored.State is not ("committed" or "skipped"))));
         var counts = new CompletionCounts(
             job.Assets.Count,
+            assetsPromoted,
+            assetsArchiveIncomplete,
             stats.TotalFiles,
             stats.CommittedFiles,
             stats.SkippedFiles,
-            failures.Count,
+            allFailures.Length,
             stats.BytesTransferred,
-            stats.BytesCommitted,
-            stats.VerifiedOriginalFiles);
+            stats.BytesCommitted);
+        var generationId = Guid.NewGuid();
+        var generationRoot = $"MB Photos Data/Catalog/generations/{generationId:D}";
         var report = new CompletionReport(
             ProtocolConstants.Version,
             jobId,
@@ -364,9 +420,13 @@ public sealed class JobCoordinator
             jobRecord.CreatedAt,
             completedAt,
             counts,
-            failures,
-            $"Reports/{jobId:D}.json",
-            new[] { "Metadata/assets.jsonl", "Metadata/albums.csv", "Metadata/albums.jsonl" });
+            allFailures,
+            $"MB Photos Data/Reports/{jobId:D}.json",
+            new CatalogGeneration(
+                generationId,
+                "MB Photos Data/Catalog/current.json",
+                generationRoot + "/assets.jsonl",
+                generationRoot + "/albums.jsonl"));
         var reportJson = JsonSerializer.Serialize(report, jsonOptions);
         PublishActivity(new ReceiverActivity(
             jobId,
@@ -382,12 +442,13 @@ public sealed class JobCoordinator
             reportState,
             completionRequestJson,
             reportJson,
-            failures,
+            allFailures,
             cancellationToken);
         // Once a job is terminal, no staged or quarantined bytes are useful.
         // Committed files live outside this exact job-scoped directory.
         await transfers.RemoveUncommittedPartialsAsync(jobId, CancellationToken.None);
         await manifestWriter.WriteAsync(report, cancellationToken);
+        await masterPromotion.CleanupSupersededAsync(cancellationToken);
         PublishActivity(new ReceiverActivity(
             jobId,
             reportState,
@@ -429,7 +490,7 @@ public sealed class JobCoordinator
             throw new ReceiverApiException(409, ErrorCodes.JobConflict, "A completed job cannot be abandoned.");
         }
 
-        if (request?.Reason is not null && request.Reason is not ("userDiscarded" or "sourceUnavailable" or "clientReset"))
+        if (request?.Reason is not null && request.Reason is not ("userDiscarded" or "sourceUnavailable" or "clientReset" or "protocolUpgradeRequired"))
         {
             throw new ReceiverApiException(400, ErrorCodes.InvalidRequest, "The abandonment reason is not supported.");
         }
@@ -484,16 +545,19 @@ public sealed class JobCoordinator
             {
                 "committed" or "skipped" => JobFileAction.Skip,
                 "failed" => JobFileAction.Conflict,
+                _ when file.Availability != Availability.Available => JobFileAction.Conflict,
                 _ when chunkCount > 0 => JobFileAction.Resume,
                 _ => JobFileAction.Upload,
             };
             decisions.Add(new FileDecision(
                 file.FileId,
                 action,
-                file.RelativePath,
+                file.Availability == Availability.Available ? file.RelativePath : null,
                 chunkCount,
                 chunkCount == 0 ? Array.Empty<ChunkRange>() : new[] { new ChunkRange(0, chunkCount - 1) },
-                file.State is "committed" or "skipped"
+                file.Availability != Availability.Available
+                    ? "sourceUnavailable"
+                    : file.State is "committed" or "skipped"
                     ? "verified"
                     : file.State == "failed"
                         ? "unresolvableConflict"
@@ -548,7 +612,7 @@ public sealed class JobCoordinator
         var storedFiles = await ledger.GetJobFilesAsync(job.JobId, cancellationToken);
         var pendingFiles = storedFiles.Where(static file => file.State == "pending").ToArray();
         var priorFiles = await ledger.FindPriorCommittedAsync(
-            pendingFiles.Select(static file => (file.FileId, file.SourceRevision)).ToArray(),
+            pendingFiles.Select(static file => (file.FileId, file.ContentRevision)).ToArray(),
             cancellationToken);
         var skips = new List<LedgerSkip>();
         foreach (var stored in pendingFiles)
@@ -558,17 +622,21 @@ public sealed class JobCoordinator
                 continue;
             }
 
-            priorFiles.TryGetValue((stored.FileId, stored.SourceRevision), out var prior);
+            priorFiles.TryGetValue((stored.FileId, stored.ContentRevision), out var prior);
             if (prior is null ||
-                prior.Kind != stored.Kind ||
-                !string.Equals(prior.ProposedPath, stored.ProposedPath, StringComparison.OrdinalIgnoreCase) ||
                 (manifestFile.ByteCount is not null && manifestFile.ByteCount != prior.CommittedBytes) ||
                 await ValidatePriorAsync(prior, cancellationToken) is not { } observedTicks)
             {
                 continue;
             }
 
-            skips.Add(new LedgerSkip(stored.FileId, prior, observedTicks));
+            var samePlacement =
+                prior.StorageArea == stored.StorageArea &&
+                prior.Roles.SequenceEqual(stored.Roles) &&
+                prior.Criticality == stored.Criticality &&
+                prior.Provenance == stored.Provenance &&
+                string.Equals(prior.ProposedPath, stored.ProposedPath, StringComparison.OrdinalIgnoreCase);
+            skips.Add(new LedgerSkip(stored.FileId, prior, observedTicks, !samePlacement));
         }
 
         await ledger.MarkSkippedAsync(job.JobId, skips, cancellationToken);
@@ -736,6 +804,7 @@ public sealed class JobCoordinator
             ErrorCodes.TokenExpired,
             ErrorCodes.TokenConsumed,
             ErrorCodes.ProtocolMismatch,
+            ErrorCodes.DestinationFormatMismatch,
             ErrorCodes.JobNotFound,
             ErrorCodes.FileNotFound,
             ErrorCodes.JobConflict,
@@ -747,6 +816,8 @@ public sealed class JobCoordinator
             ErrorCodes.UnsafePath,
             ErrorCodes.HashMismatch,
             ErrorCodes.UnavailableSource,
+            ErrorCodes.MasterConflict,
+            ErrorCodes.ArchiveIncomplete,
             ErrorCodes.NetworkLoss,
             ErrorCodes.ChangedDestination,
             ErrorCodes.InternalError,
