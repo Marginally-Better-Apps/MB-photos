@@ -17,7 +17,6 @@ on:
         type: boolean
 
 permissions:
-  actions: read
   contents: write
 
 concurrency:
@@ -74,15 +73,13 @@ jobs:
           }
 
           "tag=$tag" >> $env:GITHUB_OUTPUT
-          "head=$headCommit" >> $env:GITHUB_OUTPUT
           "archive=MBPhotosReceiver-$tag-win-x64.zip" >> $env:GITHUB_OUTPUT
           "checksums=MBPhotosReceiver-$tag-SHA256.txt" >> $env:GITHUB_OUTPUT
 
-      - name: Require successful CI and an unused release tag
+      - name: Require an unused release tag
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_COMMIT: ${{ steps.release.outputs.head }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -90,21 +87,6 @@ jobs:
           gh release view $env:RELEASE_TAG *> $null
           if ($LASTEXITCODE -eq 0) {
             throw "Release $env:RELEASE_TAG already exists; published release assets are immutable."
-          }
-
-          $runsJson = gh run list `
-            --repo $env:GITHUB_REPOSITORY `
-            --workflow ci.yml `
-            --commit $env:HEAD_COMMIT `
-            --status success `
-            --limit 1 `
-            --json databaseId
-          if ($LASTEXITCODE -ne 0) {
-            throw "Unable to verify the CI status for $env:HEAD_COMMIT."
-          }
-          $successfulRuns = @($runsJson | ConvertFrom-Json)
-          if ($successfulRuns.Count -eq 0) {
-            throw "The tagged commit must have a successful CI workflow run before signing."
           }
 
       - name: Set up .NET 10

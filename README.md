@@ -61,10 +61,6 @@ Build and test commands are documented in `windows/README.md`. The receiver is p
 
 See [SECURITY.md](SECURITY.md) and [PRIVACY.md](PRIVACY.md) for reporting and data-handling details.
 
-## Continuous integration
-
-Pull requests validate the protocol contract, run iOS unit tests on a simulator, and run Windows core and integration tests on Windows with .NET 10. Release signing is intentionally separate and requires protected repository secrets.
-
 ## Current non-goals
 
 The current release does not implement automatic deletion, editable filename templates, video transcoding, rendered Live Photo effects, USB/SMB/browser transfer, a Windows photo editor, a Windows service or autostart, Windows ARM64, macOS transfer, XMP sidecars, cloud storage, or automatic updates.

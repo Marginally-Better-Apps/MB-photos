@@ -389,6 +389,7 @@ final class SelectionAndPlannerTests: XCTestCase {
         XCTAssertTrue(result.job.files[1].proposedRelativePath.hasPrefix("MB Photos Data/Thumbnails/"))
         XCTAssertEqual(result.job.files[0].contentType, "image/heic")
         XCTAssertEqual(result.job.files[0].roles, [.masterCurrent, .rootOriginal])
+        XCTAssertEqual(result.job.files[0].photoKitResourceTypeRaw, 1)
         XCTAssertEqual(result.job.profile, ExportProfile())
     }
 
@@ -817,8 +818,29 @@ final class SelectionAndPlannerTests: XCTestCase {
 
         XCTAssertEqual(result.job.files.filter { $0.storageArea == .master }.count, 1)
         XCTAssertEqual(result.job.files.first { $0.photoKitResourceType == .alternatePhoto }?.roles, [.alternateOriginal])
+        XCTAssertEqual(result.job.files.first { $0.photoKitResourceType == .alternatePhoto }?.photoKitResourceTypeRaw, 4)
         XCTAssertEqual(result.job.files.first { $0.photoKitResourceTypeRaw == 99 }?.roles, [.auxiliary])
         XCTAssertFalse(result.job.files.contains { $0.originalFilename.contains("PROXY") })
+    }
+
+    func testUnknownResourceWithoutRawTypeFailsBeforeReceiverReconciliation() throws {
+        let resource = PhotoResourceDescriptor(
+            id: "unknown#missing-raw",
+            kind: .unknown,
+            originalFilename: "IMG_0650.UNKNOWN",
+            uniformTypeIdentifier: nil
+        )
+
+        XCTAssertThrowsError(try Self.plan(Self.asset(
+            id: "unknown-missing-raw",
+            resources: [resource]
+        ))) { error in
+            XCTAssertEqual(
+                error as? ExportPlanningError,
+                .invalidPhotoKitResourceType("unknown-missing-raw")
+            )
+            XCTAssertTrue(error.localizedDescription.contains("Refresh the library"))
+        }
     }
 
     func testAdjustmentsAndRenderedEditsAreNotOriginals() {

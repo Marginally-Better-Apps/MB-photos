@@ -18,6 +18,7 @@ enum SelectionError: LocalizedError, Equatable {
 
 enum ExportPlanningError: LocalizedError, Equatable {
     case noExportableResources(String)
+    case invalidPhotoKitResourceType(String)
     case tooManyAssets(actual: Int, limit: Int)
     case legacyJobRequiresReplanning
 
@@ -25,6 +26,8 @@ enum ExportPlanningError: LocalizedError, Equatable {
         switch self {
         case let .noExportableResources(assetID):
             "An accessible item has no authoritative PhotoKit resource (\(assetID)). Refresh the library and try again."
+        case let .invalidPhotoKitResourceType(assetID):
+            "An accessible item's cached PhotoKit resource type is incomplete (\(assetID)). Refresh the library and try again."
         case let .tooManyAssets(actual, limit):
             "This selection contains \(actual) items, but a Portable Master Library transfer supports at most \(limit) items. Split the selection into smaller transfers."
         case .legacyJobRequiresReplanning:
@@ -504,6 +507,10 @@ struct ExportPlanner: Sendable {
                 guard let fileID = resourceFileIDs[resource.id] else {
                     throw ExportPlanningError.noExportableResources(asset.id)
                 }
+                let rawResourceType = try Self.rawResourceType(
+                    for: resource,
+                    assetID: asset.id
+                )
                 let isMaster = resource.id == masterResource?.id
                 let roles = Self.roles(for: resource, asset: asset, isMaster: isMaster)
                 let dimensions = Self.dimensions(for: resource, asset: asset)
@@ -532,7 +539,7 @@ struct ExportPlanner: Sendable {
                     criticality: Self.criticality(for: roles, isMaster: isMaster),
                     provenance: .exactPhotoKitResource,
                     photoKitResourceType: resource.kind,
-                    photoKitResourceTypeRaw: resource.rawResourceType,
+                    photoKitResourceTypeRaw: rawResourceType,
                     originalFilename: resource.originalFilename,
                     proposedRelativePath: relativePath,
                     uniformTypeIdentifier: resource.uniformTypeIdentifier,
@@ -990,12 +997,34 @@ struct ExportPlanner: Sendable {
         switch kind {
         case .photo: 1
         case .video: 2
+        case .audio: 3
+        case .alternatePhoto: 4
         case .fullSizePhoto: 5
         case .fullSizeVideo: 6
+        case .adjustmentData: 7
+        case .adjustmentBasePhoto: 8
         case .pairedVideo: 9
         case .fullSizePairedVideo: 10
-        default: nil
+        case .adjustmentBasePairedVideo: 11
+        case .adjustmentBaseVideo: 12
+        case .photoProxy, .unknown: nil
         }
+    }
+
+    private static func rawResourceType(
+        for resource: PhotoResourceDescriptor,
+        assetID: String
+    ) throws -> Int {
+        if let rawResourceType = resource.rawResourceType {
+            guard rawResourceType >= 0 else {
+                throw ExportPlanningError.invalidPhotoKitResourceType(assetID)
+            }
+            return rawResourceType
+        }
+        guard let rawResourceType = rawResourceType(for: resource.kind) else {
+            throw ExportPlanningError.invalidPhotoKitResourceType(assetID)
+        }
+        return rawResourceType
     }
 
     private static func recoveryFingerprint(
