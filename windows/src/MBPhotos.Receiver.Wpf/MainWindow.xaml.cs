@@ -9,6 +9,8 @@ using MBPhotos.Receiver.Library;
 using MBPhotos.Receiver.Models;
 using MBPhotos.Receiver.Transfer;
 using Microsoft.Win32;
+using Button = System.Windows.Controls.Button;
+using Brushes = System.Windows.Media.Brushes;
 
 namespace MBPhotos.Receiver.Wpf;
 
@@ -550,7 +552,7 @@ public partial class MainWindow : Window
 
     private void ShowPanel(FrameworkElement panel)
     {
-        foreach (var item in new[] { SelectPanel, OperationPanel, PairPanel, TransferPanel, CompletePanel, LibraryPanel, ErrorPanel })
+        foreach (var item in new FrameworkElement[] { SelectPanel, OperationPanel, PairPanel, TransferPanel, CompletePanel, LibraryPanel, ErrorPanel })
         {
             item.Visibility = ReferenceEquals(item, panel) ? Visibility.Visible : Visibility.Collapsed;
         }

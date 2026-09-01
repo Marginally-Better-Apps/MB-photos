@@ -1212,7 +1212,8 @@ internal static class Program
             var before = await File.ReadAllBytesAsync(descriptor);
             await ThrowsAsync<InvalidDataException>(() =>
                 new DestinationManager(JsonOptions).OpenOrInitializeAsync(root, true));
-            True(before.SequenceEqual(await File.ReadAllBytesAsync(descriptor)));
+            var after = await File.ReadAllBytesAsync(descriptor);
+            True(before.SequenceEqual(after));
             True(!Directory.Exists(Path.Combine(root, DestinationContext.DataDirectoryName)));
         }
         finally
