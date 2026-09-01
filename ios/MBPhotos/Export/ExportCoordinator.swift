@@ -7,6 +7,7 @@ enum ExportPhase: String, Sendable {
     case planning
     case preparingResource = "Downloading PhotoKit resource"
     case renderingThumbnail = "Creating library thumbnail"
+    case hashing = "Checking file"
     case transferring = "Transferring"
     case verifying = "Verifying"
     case paused = "Paused"
@@ -29,8 +30,9 @@ struct ExportProgressState: Equatable, Sendable {
     var lastMessage: String?
 
     var overallFraction: Double {
+        if phase == .completed || phase == .completedWithFailures { return 1 }
         guard totalFileCount > 0 else {
-            return phase == .completed || phase == .completedWithFailures ? 1 : 0
+            return 0
         }
         let completedBeforeCurrent = max(currentFileIndex - 1, 0)
         return min(
@@ -41,6 +43,60 @@ struct ExportProgressState: Equatable, Sendable {
             ),
             1
         )
+    }
+
+    mutating func beginFile(index: Int, filename: String) {
+        currentFileIndex = index
+        currentFilename = filename
+        currentFileFraction = 0
+        acknowledgedBytes = 0
+        currentFileBytes = 0
+    }
+
+    mutating func advanceCurrentFile(
+        through stage: ExportFileWorkStage,
+        phaseFraction: Double
+    ) {
+        let candidate = stage.start + stage.weight * Self.boundedUnitFraction(phaseFraction)
+        currentFileFraction = max(Self.boundedUnitFraction(currentFileFraction), candidate)
+    }
+
+    mutating func completeCurrentFile() {
+        currentFileFraction = 1
+    }
+
+    private static func boundedUnitFraction(_ value: Double) -> Double {
+        guard value.isFinite else { return value == .infinity ? 1 : 0 }
+        return min(max(value, 0), 1)
+    }
+}
+
+/// End-to-end progress bands for one file. Preparation and hashing callbacks
+/// report work within their own bands, while acknowledged upload bytes occupy
+/// most of the estimate. Verification reserves the final portion so an upload
+/// never presents an uncommitted file as complete.
+enum ExportFileWorkStage: Sendable {
+    case preparation
+    case hashing
+    case transfer
+    case verification
+
+    fileprivate var start: Double {
+        switch self {
+        case .preparation: 0
+        case .hashing: 0.15
+        case .transfer: 0.25
+        case .verification: 0.95
+        }
+    }
+
+    fileprivate var weight: Double {
+        switch self {
+        case .preparation: 0.15
+        case .hashing: 0.10
+        case .transfer: 0.70
+        case .verification: 0.05
+        }
     }
 }
 
@@ -503,11 +559,9 @@ private actor ExportWorker {
                 fileGeneration &+= 1
                 let generation = fileGeneration
                 guard let decision = decisions[file.fileId] else { throw TransferError.invalidResponse }
-                progress.currentFileIndex = index + 1
-                progress.currentFilename = file.originalFilename
-                progress.currentFileFraction = 0
-                progress.acknowledgedBytes = 0
-                progress.currentFileBytes = 0
+                // Keep rollover atomic: the next index and its zero fraction
+                // represent the same overall position as the completed file.
+                progress.beginFile(index: index + 1, filename: file.originalFilename)
 
                 switch decision.action {
                 case .skip:
@@ -521,6 +575,7 @@ private actor ExportWorker {
                     )
                     successfulFileIDs.insert(file.fileId)
                     progress.skippedFileCount += 1
+                    completeCurrentFile(generation: generation)
                 case .conflict:
                     let code: APIErrorCode
                     let message: String
@@ -552,6 +607,7 @@ private actor ExportWorker {
                     )
                     terminalFailures.append(failure)
                     progress.failedFileCount += 1
+                    completeCurrentFile(generation: generation)
                 case .upload, .resume:
                     guard decision.acceptedRelativePath != nil else {
                         throw TransferError.decisionConflict(file.proposedRelativePath)
@@ -562,10 +618,18 @@ private actor ExportWorker {
                         // The worker actor owns the file loop. FileDigest checks
                         // cancellation between bounded reads so expiration can
                         // checkpoint before another upload begins.
-                        let digest = try await computeDigest(url: prepared.finalURL)
+                        let digest = try await computeDigest(
+                            url: prepared.finalURL,
+                            generation: generation
+                        )
                         try checkExecution(execution)
                         progress.currentFileBytes = digest.byteCount
                         progress.phase = .transferring
+                        advanceCurrentFile(
+                            through: .transfer,
+                            phaseFraction: 0,
+                            generation: generation
+                        )
                         let acknowledgedChunks = try await client.uploadFile(
                             jobID: plan.job.jobId,
                             fileID: file.fileId,
@@ -582,7 +646,17 @@ private actor ExportWorker {
                             }
                         }
                         try checkExecution(execution)
+                        recordAcknowledgedBytes(
+                            digest.byteCount,
+                            total: digest.byteCount,
+                            generation: generation
+                        )
                         progress.phase = .verifying
+                        advanceCurrentFile(
+                            through: .verification,
+                            phaseFraction: 0,
+                            generation: generation
+                        )
                         let receipt = try await client.commitFile(
                             jobID: plan.job.jobId,
                             fileID: file.fileId,
@@ -600,6 +674,7 @@ private actor ExportWorker {
                         await staging.removeCommitted(prepared)
                         successfulFileIDs.insert(file.fileId)
                         progress.verifiedFileCount += 1
+                        completeCurrentFile(generation: generation)
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
@@ -621,6 +696,7 @@ private actor ExportWorker {
                         terminalFailures.append(failure)
                         progress.failedFileCount += 1
                         progress.lastMessage = failure.message
+                        completeCurrentFile(generation: generation)
                     }
                 }
             }
@@ -660,7 +736,22 @@ private actor ExportWorker {
         generation: UInt64
     ) async throws -> StagedRenditionStore.Preparation {
         let preparation = try await staging.preparation(jobID: plan.job.jobId, file: file)
-        if preparation.isReady { return preparation }
+        progress.phase = file.provenance == .exactPhotoKitResource
+            ? .preparingResource
+            : .renderingThumbnail
+        advanceCurrentFile(
+            through: .preparation,
+            phaseFraction: 0,
+            generation: generation
+        )
+        if preparation.isReady {
+            advanceCurrentFile(
+                through: .preparation,
+                phaseFraction: 1,
+                generation: generation
+            )
+            return preparation
+        }
         try await staging.reset(preparation)
         guard let sourceAssetID = plan.sourceAssetIDsByFileID[file.fileId] else {
             throw RenditionError.assetUnavailable(file.assetId.uuidString)
@@ -670,7 +761,6 @@ private actor ExportWorker {
             guard let descriptor = plan.sourceResourcesByFileID[file.fileId] else {
                 throw RenditionError.resourceUnavailable(file.originalFilename)
             }
-            progress.phase = .preparingResource
             try await resourceProvider.materializeResource(
                 assetID: sourceAssetID,
                 descriptor: descriptor,
@@ -679,7 +769,6 @@ private actor ExportWorker {
                 Task { await self?.recordPreparationProgress(fraction, generation: generation) }
             }
         case .generatedThumbnail:
-            progress.phase = .renderingThumbnail
             try await thumbnailRenderer.renderThumbnail(
                 assetID: sourceAssetID,
                 to: preparation.workingURL
@@ -689,18 +778,39 @@ private actor ExportWorker {
         }
         try Task.checkCancellation()
         try await staging.markReady(preparation, sourceRevision: file.sourceRevision)
+        advanceCurrentFile(
+            through: .preparation,
+            phaseFraction: 1,
+            generation: generation
+        )
         return try await staging.preparation(jobID: plan.job.jobId, file: file)
     }
 
-    private func computeDigest(url: URL) async throws -> FileDigest {
+    private func computeDigest(url: URL, generation: UInt64) async throws -> FileDigest {
+        progress.phase = .hashing
+        advanceCurrentFile(
+            through: .hashing,
+            phaseFraction: 0,
+            generation: generation
+        )
         let hashingTask = Task.detached(priority: .utility) {
-            try FileDigest.compute(url: url)
+            try FileDigest.compute(url: url) { [weak self] fraction in
+                Task {
+                    await self?.recordHashingProgress(fraction, generation: generation)
+                }
+            }
         }
-        return try await withTaskCancellationHandler {
+        let digest = try await withTaskCancellationHandler {
             try await hashingTask.value
         } onCancel: {
             hashingTask.cancel()
         }
+        advanceCurrentFile(
+            through: .hashing,
+            phaseFraction: 1,
+            generation: generation
+        )
+        return digest
     }
 
     private func recordVerifiedAssetRevisions(
@@ -891,14 +1001,34 @@ private actor ExportWorker {
     private func recordAcknowledgedBytes(_ bytes: Int64, total: Int64, generation: UInt64) {
         guard generation == fileGeneration else { return }
         progress.acknowledgedBytes = bytes
-        progress.currentFileFraction = total == 0
+        let fraction = total == 0
             ? 1
             : min(1, Double(bytes) / Double(total))
+        progress.advanceCurrentFile(through: .transfer, phaseFraction: fraction)
     }
 
     private func recordPreparationProgress(_ fraction: Double, generation: UInt64) {
         guard generation == fileGeneration else { return }
-        progress.currentFileFraction = min(max(fraction, 0), 1)
+        progress.advanceCurrentFile(through: .preparation, phaseFraction: fraction)
+    }
+
+    private func recordHashingProgress(_ fraction: Double, generation: UInt64) {
+        guard generation == fileGeneration else { return }
+        progress.advanceCurrentFile(through: .hashing, phaseFraction: fraction)
+    }
+
+    private func advanceCurrentFile(
+        through stage: ExportFileWorkStage,
+        phaseFraction: Double,
+        generation: UInt64
+    ) {
+        guard generation == fileGeneration else { return }
+        progress.advanceCurrentFile(through: stage, phaseFraction: phaseFraction)
+    }
+
+    private func completeCurrentFile(generation: UInt64) {
+        guard generation == fileGeneration else { return }
+        progress.completeCurrentFile()
     }
 
     private func schedulePublication(immediate: Bool = false) {

@@ -837,15 +837,55 @@ final class LibraryIndexAndBackgroundTests: XCTestCase {
 
     func testSchedulingOutcomeDistinguishesQueuedFromContinuedExecution() {
         XCTAssertTrue(BackgroundTaskSchedulingOutcome.scheduled.acceptedByScheduler)
-        XCTAssertTrue(BackgroundTaskSchedulingOutcome.scheduled.grantsContinuedExecution)
+        XCTAssertTrue(BackgroundTaskSchedulingOutcome.scheduled.acceptedForContinuedExecution)
 
         let deferred = BackgroundTaskSchedulingOutcome.scheduledForLater(.lowPowerMode)
         XCTAssertTrue(deferred.acceptedByScheduler)
-        XCTAssertFalse(deferred.grantsContinuedExecution)
+        XCTAssertFalse(deferred.acceptedForContinuedExecution)
         XCTAssertEqual(deferred.diagnosticValue, "scheduled-for-later:lowPowerMode")
 
         XCTAssertFalse(BackgroundTaskSchedulingOutcome.notPermitted.acceptedByScheduler)
-        XCTAssertFalse(BackgroundTaskSchedulingOutcome.notPermitted.grantsContinuedExecution)
+        XCTAssertFalse(BackgroundTaskSchedulingOutcome.notPermitted.acceptedForContinuedExecution)
+    }
+
+    func testSystemExportProgressIncludesIntraFileWorkAndReservesCompletion() {
+        let start = ExportProgressState(
+            phase: .transferring,
+            currentFileIndex: 1,
+            totalFileCount: 1,
+            currentFileFraction: 0
+        )
+        let halfway = ExportProgressState(
+            phase: .transferring,
+            currentFileIndex: 1,
+            totalFileCount: 1,
+            currentFileFraction: 0.5
+        )
+        let lastFileStarting = ExportProgressState(
+            phase: .preparingResource,
+            currentFileIndex: 3,
+            totalFileCount: 3,
+            currentFileFraction: 0
+        )
+        let complete = ExportProgressState(
+            phase: .completed,
+            currentFileIndex: 1,
+            totalFileCount: 1,
+            currentFileFraction: 1
+        )
+
+        let startUnits = BackgroundExportProgressPolicy.completedUnitCount(from: start)
+        let halfwayUnits = BackgroundExportProgressPolicy.completedUnitCount(from: halfway)
+        XCTAssertEqual(startUnits, 0)
+        XCTAssertGreaterThan(halfwayUnits, startUnits)
+        XCTAssertLessThan(
+            BackgroundExportProgressPolicy.completedUnitCount(from: lastFileStarting),
+            BackgroundExportProgressPolicy.totalUnitCount
+        )
+        XCTAssertEqual(
+            BackgroundExportProgressPolicy.completedUnitCount(from: complete),
+            BackgroundExportProgressPolicy.totalUnitCount
+        )
     }
 
     func testSystemAnalysisProgressUsesDurableCursorNotExactSizeCoverage() {
@@ -1175,45 +1215,55 @@ final class LibraryIndexAndBackgroundTests: XCTestCase {
         let exportJobID = UUID()
         let newerExportJobID = UUID()
 
+        var analysisOwnership = BackgroundExecutionOwnership()
+        analysisOwnership.begin(.analysis(runID: analysisRunID))
         let continuedAnalysis = BackgroundCheckpointPolicy(
-            ownership: BackgroundExecutionOwnership(),
+            ownership: analysisOwnership,
             analysisIsRunning: true,
             currentAnalysisRunID: analysisRunID,
-            continuedAnalysisRunID: analysisRunID,
-            currentExportJobID: exportJobID,
-            continuedExportJobID: nil
+            currentExportJobID: exportJobID
         )
         XCTAssertFalse(continuedAnalysis.shouldCheckpointAnalysis)
         XCTAssertTrue(continuedAnalysis.shouldCheckpointExport)
 
+        var staleAnalysisOwnership = BackgroundExecutionOwnership()
+        staleAnalysisOwnership.begin(.analysis(runID: analysisRunID))
         let staleAnalysisGrant = BackgroundCheckpointPolicy(
-            ownership: BackgroundExecutionOwnership(),
+            ownership: staleAnalysisOwnership,
             analysisIsRunning: true,
             currentAnalysisRunID: UUID(),
-            continuedAnalysisRunID: analysisRunID,
-            currentExportJobID: nil,
-            continuedExportJobID: nil
+            currentExportJobID: nil
         )
         XCTAssertTrue(staleAnalysisGrant.shouldCheckpointAnalysis)
 
+        var exportOwnership = BackgroundExecutionOwnership()
+        exportOwnership.begin(.export(jobID: exportJobID))
         let continuedExport = BackgroundCheckpointPolicy(
-            ownership: BackgroundExecutionOwnership(),
+            ownership: exportOwnership,
             analysisIsRunning: true,
             currentAnalysisRunID: analysisRunID,
-            continuedAnalysisRunID: nil,
-            currentExportJobID: exportJobID,
-            continuedExportJobID: exportJobID
+            currentExportJobID: exportJobID
         )
         XCTAssertTrue(continuedExport.shouldCheckpointAnalysis)
         XCTAssertFalse(continuedExport.shouldCheckpointExport)
 
-        let staleExportGrant = BackgroundCheckpointPolicy(
+        // A scheduler submission or visible system activity is not an active
+        // execution lease until its launch handler establishes ownership.
+        let acceptedButNotStarted = BackgroundCheckpointPolicy(
             ownership: BackgroundExecutionOwnership(),
             analysisIsRunning: false,
             currentAnalysisRunID: nil,
-            continuedAnalysisRunID: nil,
-            currentExportJobID: newerExportJobID,
-            continuedExportJobID: exportJobID
+            currentExportJobID: exportJobID
+        )
+        XCTAssertTrue(acceptedButNotStarted.shouldCheckpointExport)
+
+        var staleExportOwnership = BackgroundExecutionOwnership()
+        staleExportOwnership.begin(.export(jobID: exportJobID))
+        let staleExportGrant = BackgroundCheckpointPolicy(
+            ownership: staleExportOwnership,
+            analysisIsRunning: false,
+            currentAnalysisRunID: nil,
+            currentExportJobID: newerExportJobID
         )
         XCTAssertTrue(staleExportGrant.shouldCheckpointExport)
 
@@ -1223,9 +1273,7 @@ final class LibraryIndexAndBackgroundTests: XCTestCase {
             ownership: refreshOwnership,
             analysisIsRunning: true,
             currentAnalysisRunID: analysisRunID,
-            continuedAnalysisRunID: nil,
-            currentExportJobID: exportJobID,
-            continuedExportJobID: nil
+            currentExportJobID: exportJobID
         )
         XCTAssertTrue(metadataRefresh.shouldCheckpointAnalysis)
         XCTAssertTrue(metadataRefresh.shouldCheckpointExport)
@@ -1241,9 +1289,7 @@ final class LibraryIndexAndBackgroundTests: XCTestCase {
             ownership: ownership,
             analysisIsRunning: true,
             currentAnalysisRunID: nil,
-            continuedAnalysisRunID: nil,
-            currentExportJobID: exportJobID,
-            continuedExportJobID: nil
+            currentExportJobID: exportJobID
         )
         XCTAssertFalse(whileBothCovered.shouldCheckpointAnalysis)
         XCTAssertFalse(whileBothCovered.shouldCheckpointExport)
@@ -1253,9 +1299,7 @@ final class LibraryIndexAndBackgroundTests: XCTestCase {
             ownership: ownership,
             analysisIsRunning: true,
             currentAnalysisRunID: nil,
-            continuedAnalysisRunID: nil,
-            currentExportJobID: exportJobID,
-            continuedExportJobID: nil
+            currentExportJobID: exportJobID
         )
         XCTAssertTrue(afterAnalysisLeaseEnds.shouldCheckpointAnalysis)
         XCTAssertFalse(afterAnalysisLeaseEnds.shouldCheckpointExport)

@@ -53,6 +53,47 @@ final class TransferPresentationTests: XCTestCase {
         )
     }
 
+    func testFileProgressIsMonotonicAcrossPhaseBoundaries() {
+        var progress = ExportProgressState(totalFileCount: 1)
+        progress.beginFile(index: 1, filename: "example.mov")
+
+        progress.advanceCurrentFile(through: .preparation, phaseFraction: 1)
+        XCTAssertEqual(progress.currentFileFraction, 0.15, accuracy: 0.000_001)
+
+        // Every phase begins at the preceding phase's endpoint, so resetting a
+        // phase-local callback to zero cannot make lock-screen progress regress.
+        progress.advanceCurrentFile(through: .hashing, phaseFraction: 0)
+        XCTAssertEqual(progress.currentFileFraction, 0.15, accuracy: 0.000_001)
+        progress.advanceCurrentFile(through: .hashing, phaseFraction: 0.5)
+        XCTAssertEqual(progress.currentFileFraction, 0.20, accuracy: 0.000_001)
+        progress.advanceCurrentFile(through: .transfer, phaseFraction: 0)
+        XCTAssertEqual(progress.currentFileFraction, 0.25, accuracy: 0.000_001)
+        progress.advanceCurrentFile(through: .transfer, phaseFraction: 0.5)
+        XCTAssertEqual(progress.currentFileFraction, 0.60, accuracy: 0.000_001)
+
+        // A late callback from an earlier stage cannot overwrite newer work.
+        progress.advanceCurrentFile(through: .preparation, phaseFraction: 0.25)
+        XCTAssertEqual(progress.currentFileFraction, 0.60, accuracy: 0.000_001)
+        progress.advanceCurrentFile(through: .verification, phaseFraction: 0)
+        XCTAssertEqual(progress.currentFileFraction, 0.95, accuracy: 0.000_001)
+
+        progress.completeCurrentFile()
+        XCTAssertEqual(progress.currentFileFraction, 1)
+        XCTAssertEqual(progress.overallFraction, 1)
+    }
+
+    func testFileRolloverDoesNotJumpOrRegressOverallProgress() {
+        var progress = ExportProgressState(totalFileCount: 3)
+        progress.beginFile(index: 1, filename: "first.jpg")
+        progress.completeCurrentFile()
+        let completedFirst = progress.overallFraction
+
+        progress.beginFile(index: 2, filename: "second.jpg")
+
+        XCTAssertEqual(progress.overallFraction, completedFirst, accuracy: 0.000_001)
+        XCTAssertEqual(progress.currentFileFraction, 0)
+    }
+
     func testTransferPhotoBadgesExposeLiveVideoAndEditedMetadata() {
         let liveEdited = PhotoAsset(
             id: "live-edited",

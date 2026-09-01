@@ -366,21 +366,39 @@ struct FileDigest: Equatable, Sendable {
     let byteCount: Int64
     let sha256: String
 
-    static func compute(url: URL, bufferSize: Int = 1_024 * 1_024) throws -> FileDigest {
+    static func compute(
+        url: URL,
+        bufferSize: Int = 1_024 * 1_024,
+        progress: (@Sendable (Double) -> Void)? = nil
+    ) throws -> FileDigest {
         precondition(bufferSize > 0)
         try Task.checkCancellation()
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let totalByteCount = max(
+            (attributes[.size] as? NSNumber)?.int64Value ?? 0,
+            0
+        )
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hash = SHA256()
         var count: Int64 = 0
+        var lastReportedByteCount: Int64 = 0
+        let reportingStride = Int64(8 * 1_024 * 1_024)
+        progress?(0)
         while true {
             try Task.checkCancellation()
             let data = try handle.read(upToCount: bufferSize) ?? Data()
             if data.isEmpty { break }
             hash.update(data: data)
             count += Int64(data.count)
+            if totalByteCount > 0,
+               count == totalByteCount || count - lastReportedByteCount >= reportingStride {
+                lastReportedByteCount = count
+                progress?(min(max(Double(count) / Double(totalByteCount), 0), 1))
+            }
         }
         try Task.checkCancellation()
+        progress?(1)
         return FileDigest(byteCount: count, sha256: hash.finalize().hexString)
     }
 }

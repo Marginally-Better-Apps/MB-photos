@@ -42,7 +42,7 @@ enum BackgroundTaskSchedulingOutcome: Equatable, Sendable {
         }
     }
 
-    var grantsContinuedExecution: Bool {
+    var acceptedForContinuedExecution: Bool {
         self == .scheduled
     }
 
@@ -232,16 +232,13 @@ struct BackgroundCheckpointPolicy: Equatable, Sendable {
         ownership: BackgroundExecutionOwnership,
         analysisIsRunning: Bool,
         currentAnalysisRunID: UUID?,
-        continuedAnalysisRunID: UUID?,
-        currentExportJobID: UUID?,
-        continuedExportJobID: UUID?
+        currentExportJobID: UUID?
     ) {
         let analysisCovered: Bool = if let currentAnalysisRunID {
-            continuedAnalysisRunID == currentAnalysisRunID
-                || ownership.coversAnalysis(runID: currentAnalysisRunID)
+            ownership.coversAnalysis(runID: currentAnalysisRunID)
         } else {
             // A generic processing/maintenance lease covers the transition before
-            // a durable run ID is visible. An exact continued ID never does.
+            // a durable run ID is visible.
             ownership.coversAnalysis(runID: nil)
         }
         shouldCheckpointAnalysis = analysisIsRunning && !analysisCovered
@@ -250,9 +247,7 @@ struct BackgroundCheckpointPolicy: Equatable, Sendable {
             shouldCheckpointExport = false
             return
         }
-        let continuedExportCoversCurrent = continuedExportJobID == currentExportJobID
-        shouldCheckpointExport = !continuedExportCoversCurrent
-            && !ownership.coversExport(jobID: currentExportJobID)
+        shouldCheckpointExport = !ownership.coversExport(jobID: currentExportJobID)
     }
 }
 
@@ -272,6 +267,38 @@ enum BackgroundAnalysisProgressPolicy {
     /// those terminal outcomes must still advance the work estimate.
     static func processedUnitCount(from snapshot: AnalysisRunProgressSnapshot) -> Int {
         min(max(snapshot.nextPosition, 0), snapshot.totalAssetCount)
+    }
+}
+
+enum BackgroundExportProgressPolicy {
+    /// A file count alone can remain unchanged for minutes while a large video
+    /// is materialized, hashed, and uploaded. High-resolution units let the
+    /// system observe intra-file progress and avoid describing the last file as
+    /// complete before the receiver has committed it.
+    static let totalUnitCount = 10_000
+
+    static func completedUnitCount(from state: ExportProgressState) -> Int {
+        switch state.phase {
+        case .completed, .completedWithFailures:
+            return totalUnitCount
+        default:
+            let scaled = Int(
+                floor(state.overallFraction * Double(totalUnitCount))
+            )
+            return min(max(scaled, 0), totalUnitCount - 1)
+        }
+    }
+
+    static func subtitle(from state: ExportProgressState) -> String {
+        let completed = completedUnitCount(from: state)
+        let percent = Int(
+            floor(Double(completed) * 100 / Double(totalUnitCount))
+        )
+        guard state.totalFileCount > 0, state.currentFileIndex > 0 else {
+            return "Preparing export · \(percent)%"
+        }
+        return "File \(min(state.currentFileIndex, state.totalFileCount)) of "
+            + "\(state.totalFileCount) · \(percent)%"
     }
 }
 
@@ -1142,6 +1169,14 @@ final class BackgroundWorkController {
         case .analysis: .continuedAnalysis
         case .export: .continuedExport
         }
+        let executionScope: BackgroundExecutionScope = switch kind {
+        case let .analysis(runID, _): .analysis(runID: runID)
+        case let .export(jobID): .export(jobID: jobID)
+        }
+        // Submission acceptance creates only pending scheduler work. Publish
+        // the launch-handler handshake before deciding whether this invocation
+        // can own background execution.
+        model.continuedExecutionHandlerDidStart(scope: executionScope)
         if case let .analysis(runID, includeICloudItems) = kind {
             let policy = BackgroundProcessingPolicy.userAnalysis(
                 includeICloudItems: includeICloudItems
@@ -1156,10 +1191,6 @@ final class BackgroundWorkController {
                 )
                 return
             }
-        }
-        let executionScope: BackgroundExecutionScope = switch kind {
-        case let .analysis(runID, _): .analysis(runID: runID)
-        case let .export(jobID): .export(jobID: jobID)
         }
         model.backgroundExecutionDidBegin(scope: executionScope)
         let completion = BackgroundTaskCompletion(task: task)

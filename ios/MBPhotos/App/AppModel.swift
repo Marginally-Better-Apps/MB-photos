@@ -178,8 +178,10 @@ final class AppModel: ObservableObject {
     private var libraryPresentationRevision: UInt64 = 0
     private var activeLibraryLoads = 0
     private var backgroundExecutionOwnership = BackgroundExecutionOwnership()
-    private var continuedAnalysisRunID: UUID?
-    private var continuedExportJobID: UUID?
+    /// Accepted scheduler requests that have not yet entered their launch
+    /// handlers. These are bookkeeping only, never proof of an execution lease.
+    private var pendingContinuedAnalysisRunID: UUID?
+    private var pendingContinuedExportJobID: UUID?
     private var preflightRevision: UInt64 = 0
     private var preflightTask: Task<Void, Never>?
     private var selectionRevision: UInt64 = 0
@@ -418,8 +420,8 @@ final class AppModel: ObservableObject {
             jobID: jobID,
             fileCount: fileCount
         )
-        let continued = continuedOutcome.grantsContinuedExecution
-        continuedExportJobID = continued ? jobID : nil
+        let continued = continuedOutcome.acceptedForContinuedExecution
+        pendingContinuedExportJobID = continued ? jobID : nil
         diagnostics.record(
             .info,
             category: "Export",
@@ -599,7 +601,7 @@ final class AppModel: ObservableObject {
         // to stream the first resource. A separate task can then await the same
         // worker and finish its durable pause without self-awaiting here.
         organizeCoordinator?.pauseAnalysis()
-        if !policy.isAutomatic { continuedAnalysisRunID = nil }
+        if !policy.isAutomatic { pendingContinuedAnalysisRunID = nil }
         presentAnalysisWaiting(policy: policy, reason: reason)
     }
 
@@ -697,16 +699,13 @@ final class AppModel: ObservableObject {
             )
         }
         guard isCurrentBackgroundSceneTransition(generation) else { return }
-        if #available(iOS 26.0, *) {
-            await checkpointForSceneBackground(sceneGeneration: generation)
-        } else {
-            // BGContinuedProcessing is unavailable on iOS 18–25. Ask UIKit for
-            // a finite execution window so cancellation can unwind to a durable
-            // receiver-acknowledged/analysis checkpoint before suspension.
-            let lease = LegacySceneBackgroundCheckpointLease()
-            await lease.run { [weak self] in
-                await self?.checkpointForSceneBackground(sceneGeneration: generation)
-            }
+        // Keep the launch-handler handshake or durable checkpoint alive during
+        // the scene transition. On iOS 26 the continued task owns subsequent
+        // execution only after its handler actually starts; on older releases
+        // this finite lease exists solely to unwind to a safe checkpoint.
+        let lease = SceneBackgroundCheckpointLease()
+        await lease.run { [weak self] in
+            await self?.checkpointForSceneBackground(sceneGeneration: generation)
         }
         guard isCurrentBackgroundSceneTransition(generation) else { return }
         if let userProcessingOutcome,
@@ -775,7 +774,7 @@ final class AppModel: ObservableObject {
                 completed: presentation.processedAssetCount,
                 total: presentation.totalAssetCount
             )
-            if origin == .userInitiated { continuedAnalysisRunID = nil }
+            if origin == .userInitiated { pendingContinuedAnalysisRunID = nil }
 
             // Cancels the coordinator worker and waits until its last committed
             // cursor is durably marked paused. This is the action that actually
@@ -815,6 +814,21 @@ final class AppModel: ObservableObject {
 
     func backgroundExecutionDidBegin(scope: BackgroundExecutionScope) {
         backgroundExecutionOwnership.begin(scope)
+    }
+
+    func continuedExecutionHandlerDidStart(scope: BackgroundExecutionScope) {
+        switch scope {
+        case let .analysis(runID):
+            if pendingContinuedAnalysisRunID == runID {
+                pendingContinuedAnalysisRunID = nil
+            }
+        case let .export(jobID):
+            if pendingContinuedExportJobID == jobID {
+                pendingContinuedExportJobID = nil
+            }
+        case .metadataRefresh:
+            break
+        }
     }
 
     func backgroundExecutionDidEnd(scope: BackgroundExecutionScope) async {
@@ -889,7 +903,9 @@ final class AppModel: ObservableObject {
         progress: ContinuedBackgroundProgress
     ) async -> Bool {
         defer {
-            if continuedAnalysisRunID == runID { continuedAnalysisRunID = nil }
+            if pendingContinuedAnalysisRunID == runID {
+                pendingContinuedAnalysisRunID = nil
+            }
         }
         var missingRunAttempts = 0
         while !Task.isCancelled {
@@ -928,7 +944,9 @@ final class AppModel: ObservableObject {
         progress: ContinuedBackgroundProgress
     ) async -> Bool {
         defer {
-            if continuedExportJobID == jobID { continuedExportJobID = nil }
+            if pendingContinuedExportJobID == jobID {
+                pendingContinuedExportJobID = nil
+            }
         }
         var planPublicationAttempts = 0
         while !Task.isCancelled {
@@ -941,16 +959,17 @@ final class AppModel: ObservableObject {
             }
             guard currentPlan.job.jobId == jobID else { return false }
             let state = coordinator.progress
+            let completed = BackgroundExportProgressPolicy.completedUnitCount(from: state)
             progress.update(
-                completed: state.currentFileIndex,
-                total: state.totalFileCount,
+                completed: completed,
+                total: BackgroundExportProgressPolicy.totalUnitCount,
                 title: "Exporting photos",
-                subtitle: "\(state.currentFileIndex) of \(state.totalFileCount) files"
+                subtitle: BackgroundExportProgressPolicy.subtitle(from: state)
             )
             BackgroundWorkController.shared.reportProgress(
                 kind: .export(jobID: jobID),
-                completed: state.currentFileIndex,
-                total: state.totalFileCount
+                completed: completed,
+                total: BackgroundExportProgressPolicy.totalUnitCount
             )
             switch state.phase {
             case .completed, .completedWithFailures: return true
@@ -984,7 +1003,7 @@ final class AppModel: ObservableObject {
                     runID: runID,
                     includeICloudItems: includeICloudItems
                 )
-                self.continuedAnalysisRunID = continuedOutcome.grantsContinuedExecution
+                self.pendingContinuedAnalysisRunID = continuedOutcome.acceptedForContinuedExecution
                     ? runID
                     : nil
                 if case let .scheduledForLater(reason) = continuedOutcome {
@@ -1057,28 +1076,80 @@ final class AppModel: ObservableObject {
         } else {
             nil
         }
+        await awaitPendingContinuedExecutionHandshake(
+            analysisRunID: currentAnalysisRunID,
+            exportJobID: currentExportJobID,
+            sceneGeneration: sceneGeneration
+        )
+        guard isCurrentBackgroundSceneTransition(sceneGeneration) else { return }
         let policy = BackgroundCheckpointPolicy(
             ownership: backgroundExecutionOwnership,
             analysisIsRunning: analysisIsRunning,
             currentAnalysisRunID: currentAnalysisRunID,
-            continuedAnalysisRunID: continuedAnalysisRunID,
-            currentExportJobID: currentExportJobID,
-            continuedExportJobID: continuedExportJobID
+            currentExportJobID: currentExportJobID
         )
         if policy.shouldCheckpointExport {
             guard isCurrentBackgroundSceneTransition(sceneGeneration) else { return }
             await coordinator?.checkpointForBackground(jobID: currentExportJobID)
+            if pendingContinuedExportJobID == currentExportJobID {
+                pendingContinuedExportJobID = nil
+            }
         }
         if policy.shouldCheckpointAnalysis {
             guard isCurrentBackgroundSceneTransition(sceneGeneration) else { return }
             await organizeCoordinator?.checkpointAnalysisForBackground(
                 runID: currentAnalysisRunID
             )
+            if pendingContinuedAnalysisRunID == currentAnalysisRunID {
+                pendingContinuedAnalysisRunID = nil
+            }
         }
     }
 
     private func isCurrentBackgroundSceneTransition(_ generation: UInt64) -> Bool {
         sceneTransitionFence.permitsBackground(generation) && !Task.isCancelled
+    }
+
+    private func awaitPendingContinuedExecutionHandshake(
+        analysisRunID: UUID?,
+        exportJobID: UUID?,
+        sceneGeneration: UInt64
+    ) async {
+        let hasPendingAnalysis = analysisRunID != nil
+            && pendingContinuedAnalysisRunID == analysisRunID
+        let hasPendingExport = exportJobID != nil
+            && pendingContinuedExportJobID == exportJobID
+        guard hasPendingAnalysis || hasPendingExport else { return }
+
+        // `.fail` requests are expected to launch immediately, but submission
+        // acceptance and the MainActor launch callback are separate events. Give
+        // that callback a short protected window instead of either trusting a
+        // pending ID forever or pausing a task whose handler is already queued.
+        for _ in 0..<20 {
+            guard isCurrentBackgroundSceneTransition(sceneGeneration) else { return }
+            let exportIsCovered = exportJobID.map {
+                backgroundExecutionOwnership.coversExport(jobID: $0)
+            } ?? false
+            let analysisStillPending = analysisRunID != nil
+                && pendingContinuedAnalysisRunID == analysisRunID
+                && !backgroundExecutionOwnership.coversAnalysis(runID: analysisRunID)
+            let exportStillPending = exportJobID != nil
+                && pendingContinuedExportJobID == exportJobID
+                && !exportIsCovered
+            guard analysisStillPending || exportStillPending else { return }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        diagnostics.record(
+            .warning,
+            category: "Background Work",
+            message: "Continued task launch handler did not start before scene checkpoint",
+            metadata: [
+                "analysisPending": analysisRunID != nil
+                    && pendingContinuedAnalysisRunID == analysisRunID ? "true" : "false",
+                "exportPending": exportJobID != nil
+                    && pendingContinuedExportJobID == exportJobID ? "true" : "false"
+            ]
+        )
     }
 
     private func runPreflight(
@@ -1261,7 +1332,7 @@ final class AppModel: ObservableObject {
 }
 
 @MainActor
-private final class LegacySceneBackgroundCheckpointLease {
+private final class SceneBackgroundCheckpointLease {
     private var identifier: UIBackgroundTaskIdentifier = .invalid
     private var work: Task<Void, Never>?
 
