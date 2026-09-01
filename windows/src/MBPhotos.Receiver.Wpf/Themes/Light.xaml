@@ -1,0 +1,33 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <SolidColorBrush x:Key="AppBackgroundBrush" Color="#F3F5FA" />
+    <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFFFF" />
+    <SolidColorBrush x:Key="SurfaceSecondaryBrush" Color="#F7F8FC" />
+    <SolidColorBrush x:Key="SurfaceElevatedBrush" Color="#FFFFFFFF" />
+    <SolidColorBrush x:Key="ControlBackgroundBrush" Color="#FFFFFFFF" />
+    <SolidColorBrush x:Key="ControlHoverBrush" Color="#EEF2FA" />
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#192033" />
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="#616B82" />
+    <SolidColorBrush x:Key="TextTertiaryBrush" Color="#858DA0" />
+    <SolidColorBrush x:Key="BorderBrush" Color="#DDE2EC" />
+    <SolidColorBrush x:Key="DividerBrush" Color="#E8EBF2" />
+    <SolidColorBrush x:Key="AccentBrush" Color="#3974E8" />
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="#2F65D4" />
+    <SolidColorBrush x:Key="AccentPressedBrush" Color="#2857BC" />
+    <SolidColorBrush x:Key="AccentForegroundBrush" Color="#FFFFFFFF" />
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="#E9F0FF" />
+    <LinearGradientBrush x:Key="AccentGradientBrush" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#3E8CF4" Offset="0" />
+        <GradientStop Color="#635BE7" Offset="1" />
+    </LinearGradientBrush>
+    <SolidColorBrush x:Key="SuccessBrush" Color="#18825F" />
+    <SolidColorBrush x:Key="SuccessSoftBrush" Color="#E6F6EF" />
+    <SolidColorBrush x:Key="WarningBrush" Color="#A75B0A" />
+    <SolidColorBrush x:Key="WarningSoftBrush" Color="#FFF2D9" />
+    <SolidColorBrush x:Key="ErrorBrush" Color="#C43B4D" />
+    <SolidColorBrush x:Key="ErrorSoftBrush" Color="#FDECEF" />
+    <SolidColorBrush x:Key="FocusBrush" Color="#3974E8" />
+    <SolidColorBrush x:Key="DisabledBrush" Color="#A7ADBC" />
+    <SolidColorBrush x:Key="QrBackgroundBrush" Color="#FFFFFFFF" />
+    <Color x:Key="ShadowColor">#250F1830</Color>
+</ResourceDictionary>

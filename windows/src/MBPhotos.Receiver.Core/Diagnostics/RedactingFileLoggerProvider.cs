@@ -26,10 +26,7 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
 
     public RedactingFileLoggerProvider(string? logDirectory = null)
     {
-        var directory = logDirectory ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "MarginallyBetterPhotos",
-            "Receiver");
+        var directory = logDirectory ?? Path.GetDirectoryName(GetDefaultLogPath())!;
         Directory.CreateDirectory(directory);
         logPath = Path.Combine(directory, "receiver.log");
         writerTask = Task.Run(ProcessCommandsAsync);
@@ -37,19 +34,38 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
 
     public string LogPath => logPath;
 
+    public static string GetDefaultLogPath() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "MarginallyBetterPhotos",
+        "Receiver",
+        "receiver.log");
+
     public ILogger CreateLogger(string categoryName) => new RedactingLogger(this, categoryName);
 
     public async Task ExportAsync(string destinationPath, CancellationToken cancellationToken = default)
     {
         await FlushAsync(cancellationToken).ConfigureAwait(false);
-        if (!File.Exists(logPath))
+        await ExportLogFileAsync(logPath, destinationPath, cancellationToken).ConfigureAwait(false);
+    }
+
+    public static Task ExportExistingAsync(
+        string destinationPath,
+        CancellationToken cancellationToken = default) =>
+        ExportLogFileAsync(GetDefaultLogPath(), destinationPath, cancellationToken);
+
+    private static async Task ExportLogFileAsync(
+        string sourcePath,
+        string destinationPath,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(sourcePath))
         {
             await File.WriteAllTextAsync(destinationPath, "No diagnostic events have been recorded.\n", cancellationToken).ConfigureAwait(false);
             return;
         }
 
         await using var input = new FileStream(
-            logPath,
+            sourcePath,
             FileMode.Open,
             FileAccess.Read,
             FileShare.ReadWrite | FileShare.Delete,

@@ -32,6 +32,7 @@ internal static class Program
             ("shared protocol fixtures", TestProtocolFixturesAsync),
             ("v2 manifest semantic invariants", TestV2ManifestSemanticsAsync),
             ("pair token expiry, replay, and session auth", TestPairingAsync),
+            ("verified thumbnails and completion counts flow through receiver activity", TestThumbnailActivityAsync),
             ("destination initialization and schema migration", TestDestinationAndLedgerAsync),
             ("v2 ledger migration backfills chunk cursors and progress counters", TestLedgerV2MigrationAsync),
             ("receiver-owned and escaping paths are rejected without mutation", TestProtectedReceiverPathsAsync),
@@ -298,28 +299,188 @@ internal static class Program
     private static Task TestPairingAsync()
     {
         var pairing = new PairingSessionManager();
+        var observed = new List<PairingSessionSnapshot>();
+        pairing.StateChanged += (_, _) => throw new InvalidOperationException("observer failure");
+        pairing.StateChanged += (_, snapshot) => observed.Add(snapshot);
+
         var expired = pairing.StartRun(TimeSpan.FromSeconds(-1));
         var request = PairRequest(expired.Token);
         Equal(ErrorCodes.TokenExpired, Throws<ReceiverApiException>(() => pairing.Redeem(request)).Error.Code);
 
-        var run = pairing.StartRun();
-        var session = pairing.Redeem(PairRequest(run.Token));
-        True(pairing.Authorize("Bearer " + session));
+        var renewed = pairing.RefreshExpiredInvitation(expired.ExpiresAt, TimeSpan.FromMinutes(1));
+        True(renewed.InvitationToken is not null);
+        True(!string.Equals(expired.Token, renewed.InvitationToken, StringComparison.Ordinal));
+        var session = pairing.Redeem(PairRequest(renewed.InvitationToken!));
+        True(pairing.Authorize("Bearer " + session), "the redeemed bearer was not authorized");
         True(!pairing.Authorize("Bearer wrong"));
-        Equal(ErrorCodes.TokenConsumed, Throws<ReceiverApiException>(() => pairing.Redeem(PairRequest(run.Token))).Error.Code);
+        Equal(ErrorCodes.TokenConsumed,
+            Throws<ReceiverApiException>(() => pairing.Redeem(PairRequest(renewed.InvitationToken!))).Error.Code);
+
+        var consumed = pairing.RefreshExpiredInvitation(DateTimeOffset.MaxValue);
+        True(consumed.InvitationToken is null,
+            "an expiry refresh recreated an invitation after concurrent-style redemption");
+
+        var invitation = pairing.EnsureInvitation();
+        var unchanged = pairing.EnsureInvitation();
+        Equal(invitation.InvitationToken, unchanged.InvitationToken,
+            "ensuring an invitation rotated an already displayed QR");
+        True(pairing.Authorize("Bearer " + session), "creating an invitation invalidated the current bearer");
+
+        var replacement = pairing.Redeem(PairRequest(invitation.InvitationToken!));
+        True(!pairing.Authorize("Bearer " + session), "a new pairing did not replace the prior bearer");
+        True(pairing.Authorize("Bearer " + replacement));
+
+        var staleEnsure = pairing.EnsureInvitationForAuthorizedSession("Bearer " + session);
+        True(staleEnsure.InvitationToken is null,
+            "a stale bearer recreated an invitation after a newer pairing");
+        var authorizedInvitation = pairing.EnsureInvitationForAuthorizedSession("Bearer " + replacement);
+        True(authorizedInvitation.InvitationToken is not null,
+            "the current bearer could not create its next invitation");
+        var newest = pairing.Redeem(PairRequest(authorizedInvitation.InvitationToken!));
+        var lateCompletion = pairing.EnsureInvitationForAuthorizedSession("Bearer " + replacement);
+        True(lateCompletion.InvitationToken is null && pairing.Authorize("Bearer " + newest),
+            "a late completion callback resurrected a QR after a newer phone paired");
+
+        var idle = pairing.RefreshInvitation();
+        True(idle.InvitationToken is not null && idle.HasActiveSession);
+        var retracted = pairing.RetractInvitation();
+        True(retracted.InvitationToken is null && retracted.HasActiveSession);
+        True(pairing.Authorize("Bearer " + newest), "retracting an idle invitation invalidated the bearer");
+        True(observed.Count >= 7, "pairing state changes were not observable");
         pairing.EndRun();
+        True(observed.Zip(observed.Skip(1), static (before, after) => after.Revision > before.Revision).All(static increasing => increasing),
+            "pairing observer revisions were not strictly monotonic");
         return Task.CompletedTask;
+    }
+
+    private static async Task TestThumbnailActivityAsync()
+    {
+        await using var context = await TestContext.CreateAsync();
+        var ids = new StableIds();
+        var masterBytes = Encoding.UTF8.GetBytes("verified master");
+        var thumbnailBytes = new byte[] { 0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9 };
+        var baseline = Job(masterBytes, ids, Guid.NewGuid(), new string('b', 64));
+        var asset = baseline.Assets.Single();
+        var thumbnailId = Guid.NewGuid();
+        var thumbnailRelativePath = $"MB Photos Data/Thumbnails/{ids.AssetId:D}/{thumbnailId:D}.jpg";
+        var thumbnail = new ExportFile(
+            thumbnailId,
+            ids.AssetId,
+            new string('b', 64),
+            StorageArea.LibraryData,
+            new[] { RepresentationRole.Auxiliary },
+            Criticality.Optional,
+            Provenance.GeneratedThumbnail,
+            null,
+            null,
+            "thumbnail.jpg",
+            thumbnailRelativePath,
+            "public.jpeg",
+            "image/jpeg",
+            160,
+            160,
+            null,
+            thumbnailBytes.LongLength,
+            Sha(thumbnailBytes),
+            asset.CreationDate,
+            Availability.Available);
+        var job = baseline with
+        {
+            Assets = new[] { asset with { Files = new[] { asset.Files.Single(), thumbnail } } },
+        };
+
+        var masterActivity = new TaskCompletionSource<ReceiverActivity>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thumbnailActivity = new TaskCompletionSource<ReceiverActivity>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resumedActivity = new TaskCompletionSource<ReceiverActivity>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var terminalActivity = new TaskCompletionSource<ReceiverActivity>(TaskCreationOptions.RunContinuationsAsynchronously);
+        context.Coordinator.ActivityChanged += (_, activity) =>
+        {
+            if (activity.CurrentRelativePath == asset.Files.Single().ProposedRelativePath)
+            {
+                masterActivity.TrySetResult(activity);
+            }
+            if (activity.CurrentRelativePath == thumbnailRelativePath &&
+                activity.LatestThumbnailRelativePath is not null)
+            {
+                thumbnailActivity.TrySetResult(activity);
+            }
+            if (activity.State == "planning" && activity.LatestThumbnailRelativePath is not null)
+            {
+                resumedActivity.TrySetResult(activity);
+            }
+            if (activity.State == "completed")
+            {
+                terminalActivity.TrySetResult(activity);
+            }
+        };
+
+        await context.Coordinator.CreateJobAsync(job);
+        await context.Coordinator.PutChunkAsync(
+            job.JobId,
+            ids.FileId,
+            0,
+            0,
+            masterBytes.Length - 1,
+            masterBytes.Length,
+            Sha(masterBytes),
+            new MemoryStream(masterBytes));
+        await context.Coordinator.CommitAsync(
+            job.JobId,
+            ids.FileId,
+            new CommitFileRequest(masterBytes.Length, Sha(masterBytes)));
+        var beforeThumbnail = await masterActivity.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        True(beforeThumbnail.LatestThumbnailRelativePath is null,
+            "a non-thumbnail commit was projected as a preview");
+
+        await context.Coordinator.PutChunkAsync(
+            job.JobId,
+            thumbnailId,
+            0,
+            0,
+            thumbnailBytes.Length - 1,
+            thumbnailBytes.Length,
+            Sha(thumbnailBytes),
+            new MemoryStream(thumbnailBytes));
+        await context.Coordinator.CommitAsync(
+            job.JobId,
+            thumbnailId,
+            new CommitFileRequest(thumbnailBytes.Length, Sha(thumbnailBytes)));
+        var committedThumbnail = await thumbnailActivity.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Equal(thumbnailRelativePath, committedThumbnail.LatestThumbnailRelativePath);
+        True(File.Exists(context.PathPolicy.ResolveUnderRoot(context.Root, thumbnailRelativePath)),
+            "the projected thumbnail was not committed beneath the library root");
+
+        var resumed = await context.Coordinator.CreateJobAsync(job);
+        Equal(JobState.Transferring, resumed.State);
+        var resumedPreview = await resumedActivity.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Equal(thumbnailRelativePath, resumedPreview.LatestThumbnailRelativePath,
+            "resume activity did not retain the latest verified thumbnail");
+
+        var report = await context.Coordinator.CompleteAsync(
+            job.JobId,
+            new CompleteJobRequest(DateTimeOffset.UtcNow));
+        var terminal = await terminalActivity.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Equal(thumbnailRelativePath, terminal.LatestThumbnailRelativePath);
+        Equal(report.Counts, terminal.CompletionCounts,
+            "terminal activity did not project durable completion counts");
+        Equal(2, terminal.CompletionCounts!.FilesPlanned);
     }
 
     private static async Task TestActivityFeedAsync()
     {
         using var feed = new ReceiverActivityFeed();
         feed.Activate(7);
+        var firstJobId = Guid.NewGuid();
+        var secondJobId = Guid.NewGuid();
+        var siblingJobId = Guid.NewGuid();
         var calls = 0;
         var concurrent = 0;
         var maximumConcurrent = 0;
         var urgentError = new TaskCompletionSource<ReceiverActivityEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
         var terminal = new TaskCompletionSource<ReceiverActivityEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondJob = new TaskCompletionSource<ReceiverActivityEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var siblingRejected = new TaskCompletionSource<ReceiverActivityEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var siblingTransfer = new TaskCompletionSource<ReceiverActivityEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         feed.ActivityAvailable += (_, _) => throw new InvalidOperationException("observer failure");
         feed.ActivityAvailable += (_, envelope) =>
@@ -337,12 +498,24 @@ internal static class Program
             {
                 urgentError.TrySetResult(envelope);
             }
+            if (envelope.Activity.JobId == secondJobId)
+            {
+                secondJob.TrySetResult(envelope);
+            }
+            if (envelope.Activity.JobId == siblingJobId && envelope.Activity.State == "rejected")
+            {
+                siblingRejected.TrySetResult(envelope);
+            }
+            if (envelope.Activity.JobId == siblingJobId && envelope.Activity.State == "transferring")
+            {
+                siblingTransfer.TrySetResult(envelope);
+            }
         };
 
         for (var index = 0; index < 10_000; index++)
         {
             feed.Publish(7, new ReceiverActivity(
-                Guid.Empty,
+                firstJobId,
                 "transferring",
                 index,
                 10_000,
@@ -355,17 +528,30 @@ internal static class Program
         True(calls <= 3, $"ordinary progress was delivered {calls} times in 250 ms");
 
         var errorStarted = System.Diagnostics.Stopwatch.StartNew();
-        feed.Publish(7, new ReceiverActivity(Guid.Empty, "transferring", 1, 10_000, 1, null, 1, "retryable error"));
+        feed.Publish(7, new ReceiverActivity(firstJobId, "transferring", 1, 10_000, 1, null, 1, "retryable error"));
         var deliveredError = await urgentError.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Equal("retryable error", deliveredError.Activity.ErrorMessage);
         True(errorStarted.Elapsed < TimeSpan.FromMilliseconds(500), "error activity was not delivered promptly");
 
         var started = System.Diagnostics.Stopwatch.StartNew();
-        feed.Publish(7, new ReceiverActivity(Guid.Empty, "completed", 10_000, 10_000, 10_000, null, 1));
-        feed.Publish(7, new ReceiverActivity(Guid.Empty, "transferring", 1, 1, 1, null, 1));
+        feed.Publish(7, new ReceiverActivity(firstJobId, "completed", 10_000, 10_000, 10_000, null, 1));
+        feed.Publish(7, new ReceiverActivity(firstJobId, "transferring", 1, 1, 1, null, 1));
         var delivered = await terminal.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Equal("completed", delivered.Activity.State);
         True(started.Elapsed < TimeSpan.FromMilliseconds(500), "terminal activity was not delivered promptly");
+
+        feed.Publish(7, new ReceiverActivity(secondJobId, "transferring", 1, 2, 1, null, 1, "second job"));
+        var deliveredSecondJob = await secondJob.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Equal(secondJobId, deliveredSecondJob.Activity.JobId,
+            "a terminal job suppressed a later job in the same receiver generation");
+
+        feed.Publish(7, new ReceiverActivity(siblingJobId, "transferring", 1, 2, 1, null, 1));
+        feed.Publish(7, new ReceiverActivity(siblingJobId, "planning", 0, 2, 0, null, 1));
+        feed.Publish(7, new ReceiverActivity(siblingJobId, "rejected", 0, 2, 0, null, 1));
+        await siblingRejected.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var retainedSibling = await siblingTransfer.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Equal("transferring", retainedSibling.Activity.State,
+            "a rejected sibling erased the established transfer snapshot");
         Equal(1, maximumConcurrent, "activity observers must not run concurrently");
     }
 
@@ -597,13 +783,39 @@ internal static class Program
         callbacks.Dequeue()();
         Equal(10_002, delivered[^1].Activity.CompletedFiles);
 
+        var siblingJobId = Guid.NewGuid();
+        dispatcher.Post(ActivityEnvelope(4, "transferring", 1, jobId: siblingJobId));
+        dispatcher.Post(ActivityEnvelope(4, "planning", 0, jobId: siblingJobId));
+        dispatcher.Post(ActivityEnvelope(4, "rejected", 0, jobId: siblingJobId));
+        Equal(1, callbacks.Count, "sibling rejection queued concurrent UI callbacks");
+        callbacks.Dequeue()();
+        Equal("rejected", delivered[^1].Activity.State);
+        Equal(1, callbacks.Count, "established sibling was lost behind rejection");
+        callbacks.Dequeue()();
+        Equal("transferring", delivered[^1].Activity.State,
+            "rejected sibling erased the established dispatcher snapshot");
+
         dispatcher.Post(ActivityEnvelope(4, "transferring", 10_003));
         dispatcher.Post(ActivityEnvelope(4, "completed", 10_004));
         dispatcher.Post(ActivityEnvelope(4, "transferring", 10_005));
+        var rejectedJobId = Guid.NewGuid();
+        dispatcher.Post(ActivityEnvelope(4, "rejected", 0, jobId: rejectedJobId));
         Equal(1, callbacks.Count, "terminal activity queued a second UI callback");
         callbacks.Dequeue()();
         Equal("completed", delivered[^1].Activity.State);
+        Equal(1, callbacks.Count, "rejection overwrote or lost its place behind terminal activity");
+        callbacks.Dequeue()();
+        Equal("rejected", delivered[^1].Activity.State);
+        Equal(rejectedJobId, delivered[^1].Activity.JobId);
         Equal(0, callbacks.Count, "progress survived a terminal activity");
+
+        var secondJobId = Guid.NewGuid();
+        dispatcher.Post(ActivityEnvelope(4, "transferring", 1, jobId: secondJobId));
+        Equal(1, callbacks.Count, "a later job in the same generation was suppressed");
+        callbacks.Dequeue()();
+        Equal(secondJobId, delivered[^1].Activity.JobId);
+        dispatcher.Post(ActivityEnvelope(4, "transferring", 10_006));
+        Equal(0, callbacks.Count, "late progress from a terminal job reached the UI queue");
 
         dispatcher.Post(ActivityEnvelope(3, "transferring", 1, "stale"));
         Equal(0, callbacks.Count, "a superseded generation reached the UI queue");
@@ -619,11 +831,12 @@ internal static class Program
         long generation,
         string state,
         int completed,
-        string? error = null) =>
+        string? error = null,
+        Guid? jobId = null) =>
         new(
             generation,
             new ReceiverActivity(
-                Guid.Empty,
+                jobId ?? Guid.Empty,
                 state,
                 completed,
                 20_000,
@@ -1833,6 +2046,9 @@ internal static class Program
                 string.Equals(Convert.ToHexString(SHA256.HashData(certificate.RawData)).ToLowerInvariant(), server.CertificateFingerprint, StringComparison.Ordinal),
         };
         using var client = new HttpClient(handler) { BaseAddress = server.BaseUri };
+        var pairingEvents = new ConcurrentQueue<ReceiverPairingState>();
+        server.PairingStateChanged += (_, _) => throw new InvalidOperationException("observer failure");
+        server.PairingStateChanged += (_, state) => pairingEvents.Enqueue(state);
         var unauthorized = await client.GetAsync("v2/jobs/11111111-1111-4111-8111-111111111111");
         Equal(HttpStatusCode.Unauthorized, unauthorized.StatusCode);
         var unauthorizedError = await unauthorized.Content.ReadFromJsonAsync<ApiError>(JsonOptions);
@@ -1843,9 +2059,93 @@ internal static class Program
         response.EnsureSuccessStatusCode();
         Equal("no-store", response.Headers.CacheControl?.ToString());
         var paired = await response.Content.ReadFromJsonAsync<PairResponse>(JsonOptions);
-        client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", paired!.SessionToken);
+        var firstSession = paired!.SessionToken;
+        client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", firstSession);
+        True(server.PairingState.QrPayload is null && server.PairingState.HasActiveSession,
+            "redeeming a QR did not retract it immediately");
+
+        var expiring = server.RefreshPairingInvitation(TimeSpan.Zero);
+        var renewed = server.RefreshExpiredPairingInvitation(expiring.InvitationExpiresAt);
+        True(renewed.QrPayload is not null && renewed.HasActiveSession);
+        True(!string.Equals(expiring.QrPayload, renewed.QrPayload, StringComparison.Ordinal),
+            "the exact-expiry refresh did not rotate the invitation");
         var missing = await client.GetAsync("v2/jobs/11111111-1111-4111-8111-111111111111");
         Equal(HttpStatusCode.NotFound, missing.StatusCode);
+
+        var replacementPair = await client.PostAsJsonAsync(
+            "v2/pair",
+            PairRequest(QueryValue(renewed.QrPayload!, "token")),
+            JsonOptions);
+        replacementPair.EnsureSuccessStatusCode();
+        var replacement = await replacementPair.Content.ReadFromJsonAsync<PairResponse>(JsonOptions);
+        using var priorBearerRequest = new HttpRequestMessage(
+            HttpMethod.Get,
+            "v2/jobs/11111111-1111-4111-8111-111111111111");
+        priorBearerRequest.Headers.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", firstSession);
+        var rejectedPriorBearer = await client.SendAsync(priorBearerRequest);
+        Equal(HttpStatusCode.Unauthorized, rejectedPriorBearer.StatusCode,
+            "a new pairing did not replace the prior bearer");
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", replacement!.SessionToken);
+
+        var idleInvitation = server.RefreshPairingInvitation();
+        True(idleInvitation.QrPayload is not null);
+        var ids = new StableIds();
+        var bytes = Array.Empty<byte>();
+        var job = Job(bytes, ids, Guid.NewGuid(), new string('c', 64));
+        var planResponse = await client.PostAsJsonAsync("v2/jobs", job, JsonOptions);
+        planResponse.EnsureSuccessStatusCode();
+        True(server.PairingState.QrPayload is null,
+            "starting an authenticated job did not retract the idle invitation");
+
+        var commitResponse = await client.PostAsJsonAsync(
+            $"v2/jobs/{job.JobId:D}/files/{ids.FileId:D}/commit",
+            new CommitFileRequest(0, Sha(bytes)),
+            JsonOptions);
+        commitResponse.EnsureSuccessStatusCode();
+
+        var firstTerminal = new TaskCompletionSource<ReceiverTerminalResponseCompletedEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondTerminal = new TaskCompletionSource<ReceiverTerminalResponseCompletedEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var terminalCount = 0;
+        server.TerminalResponseCompleted += (_, _) => throw new InvalidOperationException("observer failure");
+        server.TerminalResponseCompleted += (_, terminal) =>
+        {
+            if (Interlocked.Increment(ref terminalCount) == 1)
+            {
+                firstTerminal.TrySetResult(terminal);
+            }
+            else
+            {
+                secondTerminal.TrySetResult(terminal);
+            }
+        };
+        var completeRequest = new CompleteJobRequest(DateTimeOffset.UtcNow);
+        var completeResponse = await client.PostAsJsonAsync(
+            $"v2/jobs/{job.JobId:D}/complete",
+            completeRequest,
+            JsonOptions);
+        completeResponse.EnsureSuccessStatusCode();
+        var completed = await firstTerminal.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Equal(job.JobId, completed.JobId);
+        Equal("completed", completed.State);
+        Equal(1, completed.Counts!.FilesPlanned);
+        var postTerminalQr = server.PairingState.QrPayload;
+        True(postTerminalQr is not null && server.PairingState.HasActiveSession,
+            "terminal response completion did not issue a fresh invitation while retaining the bearer");
+
+        var retryResponse = await client.PostAsJsonAsync(
+            $"v2/jobs/{job.JobId:D}/complete",
+            completeRequest,
+            JsonOptions);
+        retryResponse.EnsureSuccessStatusCode();
+        _ = await secondTerminal.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Equal(postTerminalQr, server.PairingState.QrPayload,
+            "an idempotent terminal retry rotated the displayed invitation");
+        True(pairingEvents.Any(static state => state.QrPayload is null && state.HasActiveSession),
+            "pair-consumed/retracted state was not raised");
         }
         Directory.Delete(root, true);
         Directory.Delete(logs, true);

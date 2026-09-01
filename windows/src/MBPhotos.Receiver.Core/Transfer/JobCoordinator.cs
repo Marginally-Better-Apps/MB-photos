@@ -22,6 +22,8 @@ public sealed class JobCoordinator
     private readonly SemaphoreSlim planningGate = new(1, 1);
     private readonly SemaphoreSlim observerExclusion = new(1, 1);
     private readonly ConcurrentQueue<ReceiverActivity> pendingActivities = new();
+    private readonly Dictionary<Guid, string> latestThumbnailPaths = new();
+    private readonly ConcurrentDictionary<Guid, ReceiverActivity> terminalActivities = new();
     private int activityDrainScheduled;
     private int pendingActivityCount;
 
@@ -62,24 +64,37 @@ public sealed class JobCoordinator
         ModelValidation.Validate(job);
         var totalFiles = job.Assets.Sum(static asset => asset.Files.Count);
         var manifestJson = JsonSerializer.Serialize(job, jsonOptions);
+        var presentationStarted = false;
         await AcquirePlanningGateAsync(cancellationToken);
         try
         {
-            PublishActivity(new ReceiverActivity(
-                job.JobId,
-                "planning",
-                0,
-                totalFiles,
-                0,
-                null,
-                destinationManager.RefreshInfo(destination).FreeBytes));
             var existing = await ledger.GetJobAsync(job.JobId, cancellationToken);
             if (existing is not null)
             {
+                await RestoreLatestThumbnailAsync(job.JobId, cancellationToken);
                 if (!string.Equals(existing.ManifestJson, manifestJson, StringComparison.Ordinal))
                 {
                     throw new ReceiverApiException(409, ErrorCodes.JobConflict, "The jobId already identifies a different frozen manifest.");
                 }
+
+                if (existing.State is JobState.Completed or JobState.CompletedWithFailures or JobState.Abandoned)
+                {
+                    // Recover any catalog publication that lost its terminal
+                    // response, and seed this receiver generation with the
+                    // durable terminal state before accepting late requests.
+                    PublishActivity(await BuildTerminalActivityAsync(existing, cancellationToken));
+                    return await BuildPlanAsync(job.JobId, cancellationToken);
+                }
+
+                presentationStarted = true;
+                PublishActivity(new ReceiverActivity(
+                    job.JobId,
+                    "planning",
+                    0,
+                    totalFiles,
+                    0,
+                    null,
+                    destinationManager.RefreshInfo(destination).FreeBytes));
 
                 if (existing.State == JobState.Paused)
                 {
@@ -93,6 +108,16 @@ public sealed class JobCoordinator
 
                 return await BuildPlanAsync(job.JobId, cancellationToken);
             }
+
+            presentationStarted = true;
+            PublishActivity(new ReceiverActivity(
+                job.JobId,
+                "planning",
+                0,
+                totalFiles,
+                0,
+                null,
+                destinationManager.RefreshInfo(destination).FreeBytes));
 
             var acceptedPaths = new Dictionary<Guid, string>();
             var proposedPaths = new Dictionary<Guid, string>();
@@ -164,6 +189,7 @@ public sealed class JobCoordinator
                     skip.Value.ObservedTicks,
                     skip.Value.Reuse)).ToArray(),
                 cancellationToken);
+            await RestoreLatestThumbnailAsync(job.JobId, cancellationToken);
 
             PublishActivity(new ReceiverActivity(
                 job.JobId,
@@ -175,6 +201,24 @@ public sealed class JobCoordinator
                 destinationManager.RefreshInfo(destination).FreeBytes));
             return await BuildPlanAsync(job.JobId, cancellationToken);
         }
+        catch
+        {
+            if (presentationStarted)
+            {
+                // This is an admission failure, not a terminal transfer result.
+                // It closes the queued planning state while still allowing the
+                // same durable job to be retried in this receiver generation.
+                PublishActivity(new ReceiverActivity(
+                    job.JobId,
+                    "rejected",
+                    0,
+                    totalFiles,
+                    0,
+                    null,
+                    0));
+            }
+            throw;
+        }
         finally
         {
             ReleasePlanningGate();
@@ -183,41 +227,56 @@ public sealed class JobCoordinator
 
     public async Task<JobStatus> GetStatusAsync(Guid jobId, CancellationToken cancellationToken = default)
     {
-        var job = await ledger.GetJobAsync(jobId, cancellationToken)
-            ?? throw new ReceiverApiException(404, ErrorCodes.JobNotFound, "The export job does not exist.");
-        var files = await ledger.GetJobFilesAsync(jobId, cancellationToken);
-        var decisions = await BuildDecisionsAsync(files, cancellationToken);
-        var committed = files
-            .Where(static file => file.State is "committed" or "skipped")
-            .Select(static file => new CommittedFile(
-                file.FileId,
-                "committed",
-                file.RelativePath,
-                file.CommittedBytes ?? 0,
-                file.CommittedSha256 ?? string.Empty,
-                file.CommittedAt ?? DateTimeOffset.UnixEpoch))
-            .ToArray();
-        var report = job.State is JobState.Completed or JobState.CompletedWithFailures
-            ? await manifestWriter.ReadReportAsync(jobId, cancellationToken)
-            : null;
-        if (report is not null)
+        await AcquirePlanningGateAsync(cancellationToken);
+        try
         {
-            // A crash may occur after the terminal ledger transaction but before
-            // the immutable catalog generation/current pointer is published.
-            // Never expose terminal status until that boundary is recovered.
-            await manifestWriter.EnsurePublishedAsync(report, cancellationToken);
-            await masterPromotion.CleanupSupersededAsync(cancellationToken);
+            var job = await ledger.GetJobAsync(jobId, cancellationToken)
+                ?? throw new ReceiverApiException(404, ErrorCodes.JobNotFound, "The export job does not exist.");
+            var files = await ledger.GetJobFilesAsync(jobId, cancellationToken);
+            var decisions = await BuildDecisionsAsync(files, cancellationToken);
+            var committed = files
+                .Where(static file => file.State is "committed" or "skipped")
+                .Select(static file => new CommittedFile(
+                    file.FileId,
+                    "committed",
+                    file.RelativePath,
+                    file.CommittedBytes ?? 0,
+                    file.CommittedSha256 ?? string.Empty,
+                    file.CommittedAt ?? DateTimeOffset.UnixEpoch))
+                .ToArray();
+            var report = job.State is JobState.Completed or JobState.CompletedWithFailures
+                ? await manifestWriter.ReadReportAsync(jobId, cancellationToken)
+                : null;
+            if (report is not null)
+            {
+                // A crash may occur after the terminal ledger transaction but before
+                // the immutable catalog generation/current pointer is published.
+                // Never expose terminal status until that boundary is recovered.
+                await manifestWriter.EnsurePublishedAsync(report, cancellationToken);
+                await masterPromotion.CleanupSupersededAsync(cancellationToken);
+            }
+
+            if (job.State is JobState.Completed or JobState.CompletedWithFailures or JobState.Abandoned)
+            {
+                await RestoreLatestThumbnailAsync(jobId, cancellationToken);
+                PublishActivity(await BuildTerminalActivityAsync(job, cancellationToken));
+            }
+
+            return new JobStatus(
+                ProtocolConstants.Version,
+                jobId,
+                destinationManager.RefreshInfo(destination),
+                job.State,
+                decisions,
+                committed,
+                job.CreatedAt,
+                job.UpdatedAt,
+                report);
         }
-        return new JobStatus(
-            ProtocolConstants.Version,
-            jobId,
-            destinationManager.RefreshInfo(destination),
-            job.State,
-            decisions,
-            committed,
-            job.CreatedAt,
-            job.UpdatedAt,
-            report);
+        finally
+        {
+            ReleasePlanningGate();
+        }
     }
 
     public async Task<ChunkReceipt> PutChunkAsync(
@@ -275,6 +334,13 @@ public sealed class JobCoordinator
 
             var file = await ledger.GetFileAsync(jobId, fileId, cancellationToken);
             var result = await transfers.CommitAsync(jobId, fileId, request, cancellationToken);
+            if (file?.Provenance == Provenance.GeneratedThumbnail &&
+                IsJpegPath(result.RelativePath))
+            {
+                // FileTransferService publishes only after whole-file SHA-256
+                // verification and the final destination move/ledger commit.
+                latestThumbnailPaths[jobId] = result.RelativePath;
+            }
             await PublishActivityAsync(jobId, result.RelativePath, null, cancellationToken);
             return result;
         }
@@ -334,7 +400,8 @@ public sealed class JobCoordinator
                 storedReport.Counts.FilesPlanned,
                 storedReport.Counts.BytesTransferred,
                 null,
-                destinationManager.RefreshInfo(destination).FreeBytes));
+                destinationManager.RefreshInfo(destination).FreeBytes,
+                CompletionCounts: storedReport.Counts));
             return storedReport;
         }
 
@@ -456,7 +523,8 @@ public sealed class JobCoordinator
             stats.TotalFiles,
             stats.BytesTransferred,
             null,
-            destinationManager.RefreshInfo(destination).FreeBytes));
+            destinationManager.RefreshInfo(destination).FreeBytes,
+            CompletionCounts: counts));
         return report;
         }
         finally
@@ -478,6 +546,7 @@ public sealed class JobCoordinator
         if (job.State == JobState.Abandoned)
         {
             await transfers.RemoveUncommittedPartialsAsync(jobId, CancellationToken.None);
+            PublishActivity(await BuildTerminalActivityAsync(job, cancellationToken));
             return new AbandonJobResponse(
                 jobId,
                 "abandoned",
@@ -498,14 +567,9 @@ public sealed class JobCoordinator
         var abandonedAt = DateTimeOffset.UtcNow;
         await ledger.MarkAbandonedAsync(jobId, request?.Reason, abandonedAt, removed, cancellationToken);
         await transfers.RemoveUncommittedPartialsAsync(jobId, CancellationToken.None);
-        PublishActivity(new ReceiverActivity(
-            jobId,
-            "abandoned",
-            0,
-            0,
-            0,
-            null,
-            destinationManager.RefreshInfo(destination).FreeBytes));
+        var abandoned = await ledger.GetJobAsync(jobId, cancellationToken)
+            ?? throw new ReceiverApiException(404, ErrorCodes.JobNotFound, "The export job does not exist.");
+        PublishActivity(await BuildTerminalActivityAsync(abandoned, cancellationToken));
         return new AbandonJobResponse(jobId, "abandoned", removed, abandonedAt);
         }
         finally
@@ -667,6 +731,17 @@ public sealed class JobCoordinator
         string? errorMessage,
         CancellationToken cancellationToken)
     {
+        var job = await ledger.GetJobAsync(jobId, cancellationToken);
+        if (job?.State is JobState.Completed or JobState.CompletedWithFailures or JobState.Abandoned)
+        {
+            // Late chunk/commit requests against a durable terminal job must not
+            // visually resurrect it as an active transfer, including after a
+            // process restart before this coordinator has observed the job.
+            await RestoreLatestThumbnailAsync(jobId, cancellationToken);
+            PublishActivity(await BuildTerminalActivityAsync(job, cancellationToken));
+            return;
+        }
+
         var stats = await ledger.GetStatsAsync(jobId, cancellationToken);
         PublishActivity(new ReceiverActivity(
             jobId,
@@ -681,6 +756,25 @@ public sealed class JobCoordinator
 
     private void PublishActivity(ReceiverActivity activity)
     {
+        var terminal = activity.State is "completed" or "completedWithFailures" or "abandoned";
+        if (!terminal && terminalActivities.ContainsKey(activity.JobId))
+        {
+            // Terminal state is monotonic for a durable job. Endpoint errors or
+            // idempotent retries after completion cannot reopen presentation.
+            return;
+        }
+
+        if (activity.LatestThumbnailRelativePath is null &&
+            latestThumbnailPaths.TryGetValue(activity.JobId, out var latestThumbnail))
+        {
+            activity = activity with { LatestThumbnailRelativePath = latestThumbnail };
+        }
+
+        if (terminal)
+        {
+            terminalActivities[activity.JobId] = activity;
+        }
+
         var count = Interlocked.Increment(ref pendingActivityCount);
         pendingActivities.Enqueue(activity);
         while (count > MaximumPendingActivities && pendingActivities.TryDequeue(out _))
@@ -829,6 +923,173 @@ public sealed class JobCoordinator
             throw new ReceiverApiException(400, ErrorCodes.InvalidRequest, "A completion failure contains an invalid code or message.");
         }
     }
+
+    private async Task RestoreLatestThumbnailAsync(Guid jobId, CancellationToken cancellationToken)
+    {
+        if (latestThumbnailPaths.ContainsKey(jobId))
+        {
+            return;
+        }
+
+        try
+        {
+            var files = await ledger.GetJobFilesAsync(jobId, cancellationToken);
+            foreach (var file in files
+                .Where(static file =>
+                    file.Provenance == Provenance.GeneratedThumbnail &&
+                    file.State is "committed" or "skipped")
+                .OrderByDescending(static file => file.CommittedAt))
+            {
+                if (!IsJpegPath(file.RelativePath))
+                {
+                    continue;
+                }
+
+                var path = pathPolicy.ResolveUnderRoot(destination.RootPath, file.RelativePath);
+                if (File.Exists(path))
+                {
+                    latestThumbnailPaths[jobId] = file.RelativePath;
+                    return;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            // Preview recovery is advisory. A missing, malformed, or inaccessible
+            // thumbnail cannot alter an otherwise valid resume plan.
+        }
+    }
+
+    private static bool IsJpegPath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) ||
+            extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal ReceiverActivity? GetTerminalActivity(Guid jobId) =>
+        terminalActivities.TryGetValue(jobId, out var activity) ? activity : null;
+
+    internal async Task<JobState?> GetDurableJobStateAsync(
+        Guid jobId,
+        CancellationToken cancellationToken = default)
+    {
+        await AcquirePlanningGateAsync(cancellationToken);
+        try
+        {
+            return (await ledger.GetJobAsync(jobId, cancellationToken))?.State;
+        }
+        finally
+        {
+            ReleasePlanningGate();
+        }
+    }
+
+    internal async Task PublishDurableActiveActivityAsync(
+        Guid jobId,
+        CancellationToken cancellationToken = default)
+    {
+        await AcquirePlanningGateAsync(cancellationToken);
+        try
+        {
+            var job = await ledger.GetJobAsync(jobId, cancellationToken);
+            if (job is null ||
+                job.State is JobState.Completed or JobState.CompletedWithFailures or JobState.Abandoned)
+            {
+                return;
+            }
+
+            await RestoreLatestThumbnailAsync(jobId, cancellationToken);
+            var stats = await ledger.GetStatsAsync(jobId, cancellationToken);
+            PublishActivity(new ReceiverActivity(
+                jobId,
+                "transferring",
+                stats.CommittedFiles + stats.SkippedFiles,
+                stats.TotalFiles,
+                stats.BytesTransferred,
+                null,
+                destinationManager.RefreshInfo(destination).FreeBytes));
+        }
+        finally
+        {
+            ReleasePlanningGate();
+        }
+    }
+
+    private async Task<ReceiverActivity> BuildTerminalActivityAsync(
+        LedgerJob job,
+        CancellationToken cancellationToken)
+    {
+        CompletionCounts counts;
+        var state = job.State switch
+        {
+            JobState.Completed => "completed",
+            JobState.CompletedWithFailures => "completedWithFailures",
+            JobState.Abandoned => "abandoned",
+            _ => throw new InvalidOperationException("The job is not terminal."),
+        };
+
+        if (job.State is JobState.Completed or JobState.CompletedWithFailures)
+        {
+            var report = job.ReportJson is null
+                ? await manifestWriter.ReadReportAsync(job.JobId, cancellationToken)
+                : JsonSerializer.Deserialize<CompletionReport>(job.ReportJson, jsonOptions);
+            if (report is null)
+            {
+                throw new InvalidDataException("The stored completion report is missing.");
+            }
+            await manifestWriter.EnsurePublishedAsync(report, cancellationToken);
+            await masterPromotion.CleanupSupersededAsync(cancellationToken);
+            counts = report.Counts;
+        }
+        else
+        {
+            counts = await BuildAbandonedCountsAsync(job, cancellationToken);
+        }
+
+        return new ReceiverActivity(
+            job.JobId,
+            state,
+            counts.FilesCommitted + counts.FilesSkipped,
+            counts.FilesPlanned,
+            counts.BytesTransferred,
+            null,
+            destinationManager.RefreshInfo(destination).FreeBytes,
+            CompletionCounts: counts);
+    }
+
+    private async Task<CompletionCounts> BuildAbandonedCountsAsync(
+        LedgerJob jobRecord,
+        CancellationToken cancellationToken)
+    {
+        var manifest = JsonSerializer.Deserialize<ExportJob>(jobRecord.ManifestJson, jsonOptions)
+            ?? throw new InvalidDataException("The stored job manifest is invalid.");
+        var files = await ledger.GetJobFilesAsync(jobRecord.JobId, cancellationToken);
+        var filesById = files.ToDictionary(static file => file.FileId);
+        var stats = await ledger.GetStatsAsync(jobRecord.JobId, cancellationToken);
+        var assetsSaved = manifest.Assets.Count(asset =>
+            asset.MasterFileId is { } masterId &&
+            filesById.TryGetValue(masterId, out var master) &&
+            master.State is "committed" or "skipped");
+        var archiveIncomplete = manifest.Assets.Count(asset => asset.Files.Any(manifestFile =>
+            manifestFile.Criticality == Criticality.ArchiveRequired &&
+            (!filesById.TryGetValue(manifestFile.FileId, out var stored) ||
+             stored.State is not ("committed" or "skipped"))));
+        return new CompletionCounts(
+            manifest.Assets.Count,
+            assetsSaved,
+            archiveIncomplete,
+            stats.TotalFiles,
+            stats.CommittedFiles,
+            stats.SkippedFiles,
+            stats.FailedFiles,
+            stats.BytesTransferred,
+            stats.BytesCommitted);
+    }
 }
 
 public sealed record ReceiverActivity(
@@ -839,4 +1100,6 @@ public sealed record ReceiverActivity(
     long TransferredBytes,
     string? CurrentRelativePath,
     long FreeBytes,
-    string? ErrorMessage = null);
+    string? ErrorMessage = null,
+    string? LatestThumbnailRelativePath = null,
+    CompletionCounts? CompletionCounts = null);

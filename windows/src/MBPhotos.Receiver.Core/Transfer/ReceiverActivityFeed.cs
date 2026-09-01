@@ -8,15 +8,17 @@ public sealed record ReceiverActivityEnvelope(long Generation, ReceiverActivity 
 /// </summary>
 public sealed class ReceiverActivityFeed : IDisposable
 {
+    private const int MaximumPendingTerminalActivities = 64;
     private static readonly TimeSpan PublishInterval = TimeSpan.FromMilliseconds(100);
 
     private readonly object sync = new();
     private readonly Timer timer;
     private ReceiverActivityEnvelope? latest;
     private ReceiverActivityEnvelope? urgentLatest;
+    private readonly Queue<ReceiverActivityEnvelope> terminalQueue = new();
+    private readonly HashSet<Guid> terminalJobs = new();
     private long activeGeneration;
     private bool active;
-    private bool terminalSeen;
     private int publishing;
     private int urgentQueued;
     private bool disposed;
@@ -35,7 +37,8 @@ public sealed class ReceiverActivityFeed : IDisposable
             ThrowIfDisposed();
             activeGeneration = generation;
             active = true;
-            terminalSeen = false;
+            terminalJobs.Clear();
+            terminalQueue.Clear();
             latest = null;
             urgentLatest = null;
         }
@@ -51,7 +54,8 @@ public sealed class ReceiverActivityFeed : IDisposable
             }
 
             active = false;
-            terminalSeen = false;
+            terminalJobs.Clear();
+            terminalQueue.Clear();
             latest = null;
             urgentLatest = null;
         }
@@ -62,18 +66,63 @@ public sealed class ReceiverActivityFeed : IDisposable
         ArgumentNullException.ThrowIfNull(activity);
         lock (sync)
         {
-            if (disposed || !active || activeGeneration != generation ||
-                (terminalSeen && !IsTerminal(activity.State)))
+            var terminal = IsTerminal(activity.State);
+            if (disposed || !active || activeGeneration != generation)
+            {
+                return;
+            }
+            if (terminalJobs.Contains(activity.JobId))
             {
                 return;
             }
 
-            terminalSeen |= IsTerminal(activity.State);
-            var envelope = new ReceiverActivityEnvelope(generation, activity);
-            latest = envelope;
-            if (IsUrgent(activity))
+            if (terminal)
             {
-                urgentLatest = envelope;
+                terminalJobs.Add(activity.JobId);
+                var terminalEnvelope = new ReceiverActivityEnvelope(generation, activity);
+                if (latest?.Activity.JobId == activity.JobId)
+                {
+                    latest = null;
+                }
+                if (urgentLatest?.Activity.JobId == activity.JobId)
+                {
+                    urgentLatest = null;
+                }
+                terminalQueue.Enqueue(terminalEnvelope);
+                while (terminalQueue.Count > MaximumPendingTerminalActivities)
+                {
+                    terminalQueue.Dequeue();
+                }
+            }
+            else
+            {
+                var envelope = new ReceiverActivityEnvelope(generation, activity);
+                if (activity.State == "rejected")
+                {
+                    // A rejected sibling request must not erase an already
+                    // established transfer that is still waiting in the coalesced
+                    // slot. It may erase its own unestablished planning placeholder.
+                    if (latest?.Activity.JobId == activity.JobId &&
+                        latest.Activity.State == "planning")
+                    {
+                        latest = null;
+                    }
+                    urgentLatest = envelope;
+                }
+                else
+                {
+                    var preservesEstablishedSibling = activity.State == "planning" &&
+                        latest?.Activity.JobId == activity.JobId &&
+                        latest.Activity.State is "transferring" or "finalizing";
+                    if (!preservesEstablishedSibling)
+                    {
+                        latest = envelope;
+                    }
+                    if (IsUrgent(activity))
+                    {
+                        urgentLatest = envelope;
+                    }
+                }
             }
         }
 
@@ -94,6 +143,8 @@ public sealed class ReceiverActivityFeed : IDisposable
 
             disposed = true;
             active = false;
+            terminalJobs.Clear();
+            terminalQueue.Clear();
             latest = null;
             urgentLatest = null;
         }
@@ -113,14 +164,17 @@ public sealed class ReceiverActivityFeed : IDisposable
             ReceiverActivityEnvelope? envelope;
             lock (sync)
             {
-                envelope = urgentLatest ?? latest;
-                if (ReferenceEquals(urgentLatest, envelope))
+                if (!terminalQueue.TryDequeue(out envelope))
                 {
-                    urgentLatest = null;
-                }
-                if (ReferenceEquals(latest, envelope))
-                {
-                    latest = null;
+                    envelope = urgentLatest ?? latest;
+                    if (ReferenceEquals(urgentLatest, envelope))
+                    {
+                        urgentLatest = null;
+                    }
+                    if (ReferenceEquals(latest, envelope))
+                    {
+                        latest = null;
+                    }
                 }
                 if (envelope is null || !active || envelope.Generation != activeGeneration)
                 {
@@ -153,7 +207,7 @@ public sealed class ReceiverActivityFeed : IDisposable
             var hasUrgent = false;
             lock (sync)
             {
-                hasUrgent = urgentLatest is not null && !disposed;
+                hasUrgent = (terminalQueue.Count > 0 || urgentLatest is not null) && !disposed;
             }
             if (hasUrgent)
             {
@@ -181,7 +235,7 @@ public sealed class ReceiverActivityFeed : IDisposable
         state is "completed" or "completedWithFailures" or "abandoned";
 
     private static bool IsUrgent(ReceiverActivity activity) =>
-        IsTerminal(activity.State) || activity.ErrorMessage is not null;
+        IsTerminal(activity.State) || activity.State == "rejected" || activity.ErrorMessage is not null;
 
     private void ThrowIfDisposed()
     {

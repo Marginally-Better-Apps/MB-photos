@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Drawing;
 using System.Windows;
 using System.Windows.Threading;
 using MBPhotos.Receiver.Hosting;
@@ -12,14 +13,23 @@ public partial class App : System.Windows.Application
     private Forms.NotifyIcon? trayIcon;
     private Forms.ContextMenuStrip? trayMenu;
     private Forms.ToolStripMenuItem? stopMenuItem;
+    private Icon? trayAppIcon;
     private WindowsKeepAwake? keepAwake;
     private ReceiverActivityDispatcher? activityDispatcher;
     private ApplicationLifetimeCoordinator applicationLifetime = null!;
+    private SystemThemeService themeService = null!;
     private bool closeHintShown;
+    private long appliedTrayStateRevision = -1;
+    private long terminalNotificationGeneration = long.MinValue;
+    private readonly HashSet<Guid> notifiedTerminalJobs = [];
 
     internal ReceiverActivityFeed ActivityFeed { get; private set; } = null!;
 
     internal ReceiverLifecycleController Lifecycle { get; private set; } = null!;
+
+    internal ReceiverOrchestrator ReceiverOrchestrator { get; private set; } = null!;
+
+    internal ReceiverSettingsStore SettingsStore { get; private set; } = null!;
 
     internal bool IsExiting => applicationLifetime.IsExiting;
 
@@ -29,6 +39,10 @@ public partial class App : System.Windows.Application
 
         ActivityFeed = new ReceiverActivityFeed();
         Lifecycle = new ReceiverLifecycleController(ActivityFeed);
+        SettingsStore = new ReceiverSettingsStore();
+        ReceiverOrchestrator = new ReceiverOrchestrator(Lifecycle, ActivityFeed, SettingsStore);
+        themeService = new SystemThemeService(this);
+        themeService.Start();
         activityDispatcher = new ReceiverActivityDispatcher(
             callback =>
             {
@@ -43,18 +57,21 @@ public partial class App : System.Windows.Application
             ApplyActivity);
         applicationLifetime = new ApplicationLifetimeCoordinator(
             hideWindow: () => MainWindow?.Hide(),
-            disposeLifecycle: () => Lifecycle.DisposeAsync(),
+            disposeLifecycle: () => ReceiverOrchestrator.DisposeAsync(),
             cleanupApplicationResources: CleanupApplicationResources,
             reportError: exception =>
                 System.Diagnostics.Debug.WriteLine($"Receiver shutdown failed: {exception.GetType().Name}"),
             shutdown: Shutdown);
         ActivityFeed.ActivityAvailable += ActivityFeed_ActivityAvailable;
-        Lifecycle.StateChanged += Lifecycle_StateChanged;
+        ReceiverOrchestrator.StateChanged += ReceiverOrchestrator_StateChanged;
 
         CreateTrayIcon();
         var window = new MainWindow();
+        window.Icon = AppIconFactory.CreateWindowIcon();
         MainWindow = window;
+        themeService.TrackWindow(window);
         window.Show();
+        _ = InitializeReceiverAsync();
     }
 
     internal void HandleWindowClosing(CancelEventArgs e)
@@ -68,12 +85,17 @@ public partial class App : System.Windows.Application
         if (!closeHintShown)
         {
             closeHintShown = true;
-            var active = Lifecycle.Snapshot.State is ReceiverLifecycleState.Starting or ReceiverLifecycleState.Running;
+            var active = ReceiverOrchestrator.Snapshot.State is
+                ReceiverPresentationState.Starting or
+                ReceiverPresentationState.Ready or
+                ReceiverPresentationState.Connected or
+                ReceiverPresentationState.Transferring or
+                ReceiverPresentationState.Finalizing;
             ShowNotification(
-                active ? "Receiver is still running" : "Receiver is in the notification area",
+                active ? "MB Photos is still receiving" : "MB Photos is still open",
                 active
-                    ? "The transfer continues in the notification area. Use Stop or Exit there when you are finished."
-                    : "Double-click the tray icon to show the receiver, or choose Exit to close it.",
+                    ? "You can reopen it from the notification area."
+                    : "Double-click the MB Photos icon to reopen the app.",
                 Forms.ToolTipIcon.Info);
         }
     }
@@ -120,13 +142,20 @@ public partial class App : System.Windows.Application
             trayIcon.Visible = false;
         }
         ActivityFeed.ActivityAvailable -= ActivityFeed_ActivityAvailable;
-        Lifecycle.StateChanged -= Lifecycle_StateChanged;
+        ReceiverOrchestrator.StateChanged -= ReceiverOrchestrator_StateChanged;
         activityDispatcher?.Dispose();
         activityDispatcher = null;
         ActivityFeed.Dispose();
+        if (MainWindow is { } window)
+        {
+            themeService.UntrackWindow(window);
+        }
+        themeService.Dispose();
         keepAwake?.Dispose();
         keepAwake = null;
         trayIcon?.Dispose();
+        trayAppIcon?.Dispose();
+        trayAppIcon = null;
         trayMenu?.Dispose();
         trayMenu = null;
         trayIcon = null;
@@ -146,10 +175,12 @@ public partial class App : System.Windows.Application
         trayMenu.Items.Add(new Forms.ToolStripSeparator());
         trayMenu.Items.Add(exitItem);
 
+        trayAppIcon = AppIconFactory.CreateTrayIcon();
+
         trayIcon = new Forms.NotifyIcon
         {
             ContextMenuStrip = trayMenu,
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = trayAppIcon,
             Text = "MB Photos Receiver",
             Visible = true,
         };
@@ -160,48 +191,83 @@ public partial class App : System.Windows.Application
     {
         try
         {
-            await Lifecycle.StopAsync();
-            ShowNotification("Receiver stopped", "The active receiver session was paused safely.", Forms.ToolTipIcon.Info);
+            var state = ReceiverOrchestrator.Snapshot.State;
+            if (state is ReceiverPresentationState.Paused or ReceiverPresentationState.Error)
+            {
+                await ReceiverOrchestrator.StartOrResumeAsync();
+                if (ReceiverOrchestrator.Snapshot.State == ReceiverPresentationState.Error)
+                {
+                    throw ReceiverOrchestrator.Snapshot.Error ?? new InvalidOperationException("Receiving could not start.");
+                }
+                ShowNotification("Ready to receive", "Open MB Photos to scan the new code.", Forms.ToolTipIcon.Info);
+            }
+            else if (state == ReceiverPresentationState.Setup)
+            {
+                ShowMainWindow();
+            }
+            else
+            {
+                await ReceiverOrchestrator.StopAsync(manualPause: true);
+                ShowNotification("Receiving paused", "Start again from MB Photos or the notification area.", Forms.ToolTipIcon.Info);
+            }
         }
-        catch (Exception exception)
+        catch (Exception)
         {
-            ShowNotification("Could not stop receiver", exception.Message, Forms.ToolTipIcon.Error);
+            ShowNotification("Receiver action failed", "Open MB Photos and try again.", Forms.ToolTipIcon.Error);
         }
     }
 
     private async void ExitMenuItem_Click(object? sender, EventArgs e) => await ExitAsync();
 
-    private void Lifecycle_StateChanged(object? sender, ReceiverLifecycleSnapshot state)
+    private void ReceiverOrchestrator_StateChanged(object? sender, ReceiverOrchestrationSnapshot state)
     {
         _ = Dispatcher.BeginInvoke(new Action(() =>
         {
+            if (state.Revision < appliedTrayStateRevision)
+            {
+                return;
+            }
+            appliedTrayStateRevision = state.Revision;
+
             if (stopMenuItem is not null)
             {
-                stopMenuItem.Enabled = state.State is ReceiverLifecycleState.Starting or ReceiverLifecycleState.Running;
-                stopMenuItem.Text = state.State == ReceiverLifecycleState.Starting ? "Cancel startup" : "Stop receiver";
+                stopMenuItem.Enabled = state.State != ReceiverPresentationState.Library;
+                stopMenuItem.Text = state.State switch
+                {
+                    ReceiverPresentationState.Setup => "Show setup",
+                    ReceiverPresentationState.Paused or ReceiverPresentationState.Error => "Start receiving",
+                    ReceiverPresentationState.Library => "Library open",
+                    _ => "Pause receiving",
+                };
             }
             if (trayIcon is not null)
             {
                 trayIcon.Text = state.State switch
                 {
-                    ReceiverLifecycleState.Starting => "MB Photos Receiver — Starting",
-                    ReceiverLifecycleState.Running => "MB Photos Receiver — Running",
-                    ReceiverLifecycleState.Stopping => "MB Photos Receiver — Stopping",
-                    ReceiverLifecycleState.Faulted => "MB Photos Receiver — Error",
-                    _ => "MB Photos Receiver — Stopped",
+                    ReceiverPresentationState.Starting => "MB Photos — Starting",
+                    ReceiverPresentationState.Ready => "MB Photos — Ready to scan",
+                    ReceiverPresentationState.Connected => "MB Photos — iPhone connected",
+                    ReceiverPresentationState.Transferring => "MB Photos — Receiving",
+                    ReceiverPresentationState.Finalizing => "MB Photos — Finishing transfer",
+                    ReceiverPresentationState.Paused => "MB Photos — Paused",
+                    ReceiverPresentationState.Error => "MB Photos — Needs attention",
+                    ReceiverPresentationState.Library => "MB Photos — Library",
+                    _ => "MB Photos",
                 };
             }
 
-            if (state.State is ReceiverLifecycleState.Stopped or ReceiverLifecycleState.Faulted)
+            if (state.State is not (
+                ReceiverPresentationState.Transferring or
+                ReceiverPresentationState.Finalizing))
             {
                 keepAwake?.Dispose();
                 keepAwake = null;
             }
 
-            if (state.State == ReceiverLifecycleState.Faulted && state.Error is not null && MainWindow?.IsVisible != true)
+            if (state.State == ReceiverPresentationState.Error && state.Error is not null && MainWindow?.IsVisible != true)
             {
                 ShowMainWindow();
-                ShowNotification("Receiver error", state.Error.Message, Forms.ToolTipIcon.Error);
+                ShowNotification("Receiver needs attention", "Open MB Photos to retry or choose another folder.", Forms.ToolTipIcon.Error);
             }
         }));
     }
@@ -218,34 +284,55 @@ public partial class App : System.Windows.Application
         }
 
         var activity = envelope.Activity;
-        if (activity.ErrorMessage is not null ||
-            activity.State is "completed" or "completedWithFailures" or "abandoned")
+        var terminal = activity.State is "completed" or "completedWithFailures" or "abandoned";
+        if (terminalNotificationGeneration != envelope.Generation)
+        {
+            terminalNotificationGeneration = envelope.Generation;
+            notifiedTerminalJobs.Clear();
+        }
+        var firstTerminalNotification = !terminal || notifiedTerminalJobs.Add(activity.JobId);
+
+        if (activity.ErrorMessage is not null || (terminal && firstTerminalNotification))
         {
             ShowMainWindow();
         }
 
         if (activity.ErrorMessage is not null)
         {
-            ShowNotification("Transfer error", activity.ErrorMessage, Forms.ToolTipIcon.Error);
+            ShowNotification("Transfer needs attention", "Open MB Photos to see what you can do next.", Forms.ToolTipIcon.Error);
         }
 
-        if (activity.State is "completed" or "completedWithFailures" or "abandoned")
+        if (terminal)
         {
             keepAwake?.Dispose();
             keepAwake = null;
 
+            if (!firstTerminalNotification)
+            {
+                return;
+            }
+
             if (activity.State == "completed")
             {
-                ShowNotification("Export complete", $"Verified {activity.TotalFiles:N0} files.", Forms.ToolTipIcon.Info);
+                var itemCount = activity.CompletionCounts?.AssetsPromoted;
+                ShowNotification(
+                    "Transfer complete",
+                    itemCount is { } count ? $"Saved {count:N0} item{(count == 1 ? string.Empty : "s")}." : "Your photos are ready.",
+                    Forms.ToolTipIcon.Info);
             }
             else if (activity.State == "completedWithFailures")
             {
-                ShowNotification("Export completed with failures", "Open the receiver to review the completion report.", Forms.ToolTipIcon.Warning);
+                ShowNotification("Transfer finished with issues", "Some items could not be saved. Open MB Photos for details.", Forms.ToolTipIcon.Warning);
             }
             else
             {
-                ShowNotification("Export stopped", "The iPhone abandoned the current export.", Forms.ToolTipIcon.Info);
+                ShowNotification("Transfer stopped", "Start another transfer from your iPhone whenever you’re ready.", Forms.ToolTipIcon.Info);
             }
+            return;
+        }
+
+        if (activity.State == "rejected")
+        {
             return;
         }
 
@@ -263,5 +350,19 @@ public partial class App : System.Windows.Application
         trayIcon.BalloonTipText = message;
         trayIcon.BalloonTipIcon = icon;
         trayIcon.ShowBalloonTip(5000);
+    }
+
+    private async Task InitializeReceiverAsync()
+    {
+        try
+        {
+            await ReceiverOrchestrator.InitializeAsync();
+        }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine($"Automatic receiver startup failed: {exception}");
+            ShowMainWindow();
+            ShowNotification("Receiver could not start", "Open MB Photos to retry or choose another folder.", Forms.ToolTipIcon.Error);
+        }
     }
 }

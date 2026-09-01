@@ -1,7 +1,5 @@
 using MBPhotos.Receiver.Hosting;
 using MBPhotos.Receiver.Transfer;
-using QRCoder;
-using System.IO;
 using System.Windows.Media.Imaging;
 
 namespace MBPhotos.Receiver.Wpf;
@@ -147,7 +145,7 @@ internal sealed class ReceiverLifecycleController : IAsyncDisposable
             try
             {
                 pairingQrBitmap = await Task.Run(
-                    () => CreateQrBitmap(started.QrPayload),
+                    () => QrBitmapFactory.Create(started.QrPayload),
                     CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception exception)
@@ -392,21 +390,6 @@ internal sealed class ReceiverLifecycleController : IAsyncDisposable
     {
         await receiver.DisposeAsync().ConfigureAwait(false);
     });
-
-    private static BitmapImage CreateQrBitmap(string payload)
-    {
-        using var generator = new QRCodeGenerator();
-        using var data = generator.CreateQrCode(payload, QRCodeGenerator.ECCLevel.Q);
-        var png = new PngByteQRCode(data).GetGraphic(8, drawQuietZones: true);
-        using var stream = new MemoryStream(png);
-        var image = new BitmapImage();
-        image.BeginInit();
-        image.CacheOption = BitmapCacheOption.OnLoad;
-        image.StreamSource = stream;
-        image.EndInit();
-        image.Freeze();
-        return image;
-    }
 
     private (ReceiverLifecycleStopRequest StopRequest, CancellationTokenSource? Cancellation) RecordStopRequest()
     {

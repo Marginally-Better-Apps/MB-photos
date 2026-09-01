@@ -7,13 +7,15 @@ namespace MBPhotos.Receiver.Transfer;
 /// </summary>
 public sealed class ReceiverActivityDispatcher : IDisposable
 {
+    private const int MaximumPendingTerminalActivities = 64;
     private readonly object sync = new();
     private readonly Func<Action, bool> schedule;
     private readonly Action<ReceiverActivityEnvelope> deliver;
     private ReceiverActivityEnvelope? latest;
     private ReceiverActivityEnvelope? urgent;
+    private readonly Queue<ReceiverActivityEnvelope> terminalQueue = new();
+    private readonly HashSet<Guid> terminalJobs = new();
     private long activeGeneration = long.MinValue;
-    private bool terminalSeen;
     private bool callbackScheduled;
     private bool disposed;
 
@@ -41,31 +43,65 @@ public sealed class ReceiverActivityDispatcher : IDisposable
             {
                 // A newer receiver generation supersedes every pending UI value.
                 activeGeneration = envelope.Generation;
-                terminalSeen = false;
+                terminalJobs.Clear();
+                terminalQueue.Clear();
                 latest = null;
                 urgent = null;
             }
 
-            if (terminalSeen)
+            var terminal = IsTerminal(envelope.Activity.State);
+            if (terminalJobs.Contains(envelope.Activity.JobId))
             {
                 return;
             }
 
-            if (IsTerminal(envelope.Activity.State))
+            if (terminal)
             {
-                terminalSeen = true;
-                latest = null;
+                terminalJobs.Add(envelope.Activity.JobId);
+                if (latest?.Activity.JobId == envelope.Activity.JobId)
+                {
+                    latest = null;
+                }
+                if (urgent?.Activity.JobId == envelope.Activity.JobId)
+                {
+                    urgent = null;
+                }
+                terminalQueue.Enqueue(envelope);
+                while (terminalQueue.Count > MaximumPendingTerminalActivities)
+                {
+                    terminalQueue.Dequeue();
+                }
+            }
+            else if (envelope.Activity.State == "rejected")
+            {
+                // Rejection is terminal for one request, not for the durable job.
+                // Keep an established sibling snapshot queued behind it, but
+                // discard a planning placeholder owned by the failed attempt.
+                if (latest?.Activity.JobId == envelope.Activity.JobId &&
+                    latest.Activity.State == "planning")
+                {
+                    latest = null;
+                }
                 urgent = envelope;
             }
             else if (envelope.Activity.ErrorMessage is not null)
             {
                 // Do not let progress that predates the error render after it.
-                latest = null;
+                if (latest?.Activity.JobId == envelope.Activity.JobId)
+                {
+                    latest = null;
+                }
                 urgent = envelope;
             }
             else
             {
-                latest = envelope;
+                var preservesEstablishedSibling = envelope.Activity.State == "planning" &&
+                    latest?.Activity.JobId == envelope.Activity.JobId &&
+                    latest.Activity.State is "transferring" or "finalizing";
+                if (!preservesEstablishedSibling)
+                {
+                    latest = envelope;
+                }
             }
 
             if (!callbackScheduled)
@@ -86,6 +122,8 @@ public sealed class ReceiverActivityDispatcher : IDisposable
         lock (sync)
         {
             disposed = true;
+            terminalJobs.Clear();
+            terminalQueue.Clear();
             latest = null;
             urgent = null;
         }
@@ -102,14 +140,17 @@ public sealed class ReceiverActivityDispatcher : IDisposable
                 return;
             }
 
-            envelope = urgent ?? latest;
-            if (ReferenceEquals(envelope, urgent))
+            if (!terminalQueue.TryDequeue(out envelope))
             {
-                urgent = null;
-            }
-            else
-            {
-                latest = null;
+                envelope = urgent ?? latest;
+                if (ReferenceEquals(envelope, urgent))
+                {
+                    urgent = null;
+                }
+                else
+                {
+                    latest = null;
+                }
             }
 
             if (envelope is null)
@@ -136,9 +177,10 @@ public sealed class ReceiverActivityDispatcher : IDisposable
             {
                 latest = null;
                 urgent = null;
+                terminalQueue.Clear();
                 callbackScheduled = false;
             }
-            else if (urgent is not null || latest is not null)
+            else if (terminalQueue.Count > 0 || urgent is not null || latest is not null)
             {
                 // Keep callbackScheduled true across the handoff so a producer
                 // can never enqueue a second dispatcher operation concurrently.

@@ -8,6 +8,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MBPhotos.Receiver.Wpf", "sr
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MBPhotos.Receiver.Tests", "tests\MBPhotos.Receiver.Tests\MBPhotos.Receiver.Tests.csproj", "{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MBPhotos.Receiver.Wpf.Tests", "tests\MBPhotos.Receiver.Wpf.Tests\MBPhotos.Receiver.Wpf.Tests.csproj", "{B3A8B397-4AA5-4B00-B686-384782B0C4E1}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -26,5 +28,9 @@ Global
 		{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{AF5ADE9C-BECC-4A3B-9987-41C2D7EBD7D8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B3A8B397-4AA5-4B00-B686-384782B0C4E1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B3A8B397-4AA5-4B00-B686-384782B0C4E1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B3A8B397-4AA5-4B00-B686-384782B0C4E1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B3A8B397-4AA5-4B00-B686-384782B0C4E1}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

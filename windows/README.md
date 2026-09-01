@@ -7,6 +7,7 @@ The Windows app receives a portable MB Photos library from iOS and can reopen th
 - `src/MBPhotos.Receiver.Core` contains the protocol-v2 HTTPS host, pairing, SQLite ledger, path security, incremental planning, chunk transfer, Master promotion, portable catalog, exact-copy variant export, reports, and diagnostics. It targets .NET 10 in production and conditionally targets .NET 7 only when built by the older SDK installed on the repository's macOS host.
 - `src/MBPhotos.Receiver.Wpf` is the .NET 10 Windows x64 UI and portable single-file publish target.
 - `tests/MBPhotos.Receiver.Tests` is a dependency-free console test runner. It executes the shared protocol fixtures and every normative Windows path vector, then exercises the real SQLite/transfer implementation.
+- `tests/MBPhotos.Receiver.Wpf.Tests` exercises versioned settings, presentation-state fencing, safe preview loading, malformed-image fallback, and file-handle release on Windows.
 
 ## Build and test
 
@@ -16,6 +17,7 @@ Production prerequisites are the .NET 10 SDK on Windows 10 22H2 or Windows 11:
 dotnet restore windows/MBPhotos.Windows.sln
 dotnet build windows/MBPhotos.Windows.sln -c Release
 dotnet run --project windows/tests/MBPhotos.Receiver.Tests/MBPhotos.Receiver.Tests.csproj -c Release --no-build
+dotnet run --project windows/tests/MBPhotos.Receiver.Wpf.Tests/MBPhotos.Receiver.Wpf.Tests.csproj -c Release --no-build
 ```
 
 On the repository's current macOS .NET 7 fallback, build and run only the cross-platform target:
@@ -40,8 +42,8 @@ The script publishes `MBPhotosReceiver.exe`, signs it with SHA-256 and an RFC 31
 
 ## Receiver behavior
 
-- Choosing an uninitialized folder requires the explicit initialization checkbox. Nonempty reserved `Master` or `MB Photos Data` paths are rejected and left untouched. Legacy v1 destinations are detected and rejected without modification.
-- Each process run creates a self-signed process-lifetime certificate, a 256-bit five-minute single-use pairing token, and a process-lifetime bearer session. Windows uses a temporary current-user key container because Schannel cannot serve TLS from an ephemeral private key; it is not persisted beyond certificate disposal. Tokens, filenames, album titles, and location values are redacted from diagnostics.
+- The first successful library root is saved in versioned per-user settings and starts automatically on later launches. Choosing an empty uninitialized folder requires an explicit confirmation; missing remembered locations and nonempty invalid destinations are never recreated. Nonempty reserved `Master` or `MB Photos Data` paths are rejected and left untouched. Legacy v1 destinations are detected and rejected without modification.
+- Each process run creates a self-signed process-lifetime certificate, a renewable 256-bit five-minute pairing invitation, and a replaceable bearer session. An expired unused invitation refreshes without restarting the listener; pairing and job admission retract the displayed invitation, while a terminal response publishes a fresh invitation and retains the bearer for idempotent retries. Windows uses a temporary current-user key container because Schannel cannot serve TLS from an ephemeral private key; it is not persisted beyond certificate disposal. Tokens, filenames, album titles, and location values are redacted from diagnostics.
 - Uploads use sequential 8 MiB chunks. Receipts, the first observed total for unknown-size outputs, and original receipt timestamps are durable in SQLite. Retrying an acknowledged chunk is idempotent.
 - Each chunk and complete file is SHA-256 verified. Files are received below `MB Photos Data/.mbphotos/staging`; verified support resources are retained below `MB Photos Data/Resources`, and verified current representations are safely promoted below `Master`.
 - Crash reconciliation truncates bytes flushed without a ledger receipt and recognizes a hash-valid final file moved before its commit transaction.
@@ -49,7 +51,7 @@ The script publishes `MBPhotosReceiver.exe`, signs it with SHA-256 and an RFC 31
 - All output paths are revalidated at the Windows security boundary. Rooted/traversal/device paths and any existing symbolic-link or junction ancestor are rejected.
 - Stable per-resource identities and content revisions allow a nondestructive edit to replace only the current Master representation while unchanged originals and Live Photo motion remain verified.
 - Completion can terminalize explicitly declared per-file failures as `completedWithFailures`. The completion request and report are stored transactionally, so an identical retry recovers a lost response; a different retry returns `job_conflict`.
-- Closing the window keeps an active transfer running in the notification area. Double-click the tray icon to reopen it, or use its Show, Stop, and Exit commands. Completion and transfer errors bring the window back and show a notification. Stop and Exit pause active jobs safely before releasing the destination.
+- Closing the window keeps an active transfer running in the notification area. Double-click the tray icon to reopen it, or use its Show, Pause/Start, and Exit commands. Completion and transfer errors bring the window back and show a notification. A manual pause lasts for the process lifetime; entering Library safely stops receiving, and returning starts it again with a fresh invitation unless receiving was manually paused first. Stop and Exit pause active jobs safely before releasing the destination.
 - Receiver startup, shutdown, SQLite initialization, certificate creation, QR generation, diagnostics logging, and manifest output never run on the WPF dispatcher. Progress is coalesced to at most ten ordinary updates per second; terminal and error activity is delivered promptly.
 - Portable metadata is published as immutable catalog generations with an atomic `current.json` pointer. Catalog paths are relative to the library root, so moving the complete root preserves the library.
 
