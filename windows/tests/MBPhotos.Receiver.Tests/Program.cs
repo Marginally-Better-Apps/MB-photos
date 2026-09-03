@@ -927,6 +927,14 @@ internal static class Program
             // The queue should reserve/coalesce urgent diagnostics even when a
             // low-priority flood has filled every ordinary slot.
             logger.LogError("urgent-marker token=secret filename=private.jpg latitude=44.1");
+            try
+            {
+                ThrowDiagnosticFailureWithPrivateMessage();
+            }
+            catch (Exception exception)
+            {
+                logger.LogCritical(exception, "managed-crash-marker");
+            }
 
             var exported = Path.Combine(root, "export.log");
             await provider.ExportAsync(exported);
@@ -937,6 +945,10 @@ internal static class Program
             True(contents.Contains("latitude=[redacted]", StringComparison.Ordinal));
             True(!contents.Contains("secret", StringComparison.Ordinal));
             True(!contents.Contains("private.jpg", StringComparison.Ordinal));
+            True(contents.Contains("managed-crash-marker", StringComparison.Ordinal));
+            True(contents.Contains("System.InvalidOperationException", StringComparison.Ordinal));
+            True(contents.Contains(nameof(ThrowDiagnosticFailureWithPrivateMessage), StringComparison.Ordinal));
+            True(!contents.Contains("private-exception-message", StringComparison.Ordinal));
             True(new FileInfo(provider.LogPath).Length <= (2 * 1024 * 1024) + (64 * 1024),
                 "the bounded current diagnostic log exceeded its rotation allowance");
         }
@@ -946,6 +958,9 @@ internal static class Program
             Directory.Delete(root, true);
         }
     }
+
+    private static void ThrowDiagnosticFailureWithPrivateMessage() =>
+        throw new InvalidOperationException("private-exception-message filename=private.jpg");
 
     private static async Task TestHundredThousandAssetFinalizationAsync()
     {

@@ -1,15 +1,20 @@
 using System.ComponentModel;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Threading;
+using MBPhotos.Receiver.Diagnostics;
 using MBPhotos.Receiver.Hosting;
 using MBPhotos.Receiver.Transfer;
+using Microsoft.Extensions.Logging;
 using Forms = System.Windows.Forms;
 
 namespace MBPhotos.Receiver.Wpf;
 
 public partial class App : System.Windows.Application
 {
+    private readonly RedactingFileLoggerProvider diagnostics = new();
+    private readonly ILogger logger;
     private Forms.NotifyIcon? trayIcon;
     private Forms.ContextMenuStrip? trayMenu;
     private Forms.ToolStripMenuItem? stopMenuItem;
@@ -22,8 +27,19 @@ public partial class App : System.Windows.Application
     private long appliedTrayStateRevision = -1;
     private long terminalNotificationGeneration = long.MinValue;
     private readonly HashSet<Guid> notifiedTerminalJobs = [];
+    private int lastLoggedPresentationState = -1;
+
+    public App()
+    {
+        logger = diagnostics.CreateLogger("MBPhotos.Receiver.Wpf.App");
+        DispatcherUnhandledException += App_DispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+        TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
+    }
 
     internal ReceiverActivityFeed ActivityFeed { get; private set; } = null!;
+
+    internal RedactingFileLoggerProvider Diagnostics => diagnostics;
 
     internal ReceiverLifecycleController Lifecycle { get; private set; } = null!;
 
@@ -35,43 +51,72 @@ public partial class App : System.Windows.Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
-        base.OnStartup(e);
+        try
+        {
+            base.OnStartup(e);
+            logger.LogInformation(
+                "Desktop receiver starting version={Version} framework={Framework} os={OperatingSystem} processId={ProcessId}",
+                typeof(App).Assembly.GetName().Version,
+                RuntimeInformation.FrameworkDescription,
+                RuntimeInformation.OSDescription,
+                Environment.ProcessId);
 
-        ActivityFeed = new ReceiverActivityFeed();
-        Lifecycle = new ReceiverLifecycleController(ActivityFeed);
-        SettingsStore = new ReceiverSettingsStore();
-        ReceiverOrchestrator = new ReceiverOrchestrator(Lifecycle, ActivityFeed, SettingsStore);
-        themeService = new SystemThemeService(this);
-        themeService.Start();
-        activityDispatcher = new ReceiverActivityDispatcher(
-            callback =>
-            {
-                if (Dispatcher.HasShutdownStarted)
+            ActivityFeed = new ReceiverActivityFeed();
+            Lifecycle = new ReceiverLifecycleController(ActivityFeed, diagnostics);
+            SettingsStore = new ReceiverSettingsStore();
+            ReceiverOrchestrator = new ReceiverOrchestrator(Lifecycle, ActivityFeed, SettingsStore);
+            themeService = new SystemThemeService(this);
+            themeService.Start();
+            activityDispatcher = new ReceiverActivityDispatcher(
+                callback =>
                 {
-                    return false;
-                }
+                    if (Dispatcher.HasShutdownStarted)
+                    {
+                        return false;
+                    }
 
-                _ = Dispatcher.BeginInvoke(DispatcherPriority.Normal, callback);
-                return true;
-            },
-            ApplyActivity);
-        applicationLifetime = new ApplicationLifetimeCoordinator(
-            hideWindow: () => MainWindow?.Hide(),
-            disposeLifecycle: () => ReceiverOrchestrator.DisposeAsync(),
-            cleanupApplicationResources: CleanupApplicationResources,
-            reportError: exception =>
-                System.Diagnostics.Debug.WriteLine($"Receiver shutdown failed: {exception.GetType().Name}"),
-            shutdown: Shutdown);
-        ActivityFeed.ActivityAvailable += ActivityFeed_ActivityAvailable;
-        ReceiverOrchestrator.StateChanged += ReceiverOrchestrator_StateChanged;
+                    _ = Dispatcher.BeginInvoke(DispatcherPriority.Normal, callback);
+                    return true;
+                },
+                ApplyActivity);
+            applicationLifetime = new ApplicationLifetimeCoordinator(
+                hideWindow: () => MainWindow?.Hide(),
+                disposeLifecycle: () => ReceiverOrchestrator.DisposeAsync(),
+                cleanupApplicationResources: CleanupApplicationResources,
+                reportError: exception => logger.LogError(exception, "Receiver shutdown stage failed"),
+                shutdown: Shutdown);
+            ActivityFeed.ActivityAvailable += ActivityFeed_ActivityAvailable;
+            ReceiverOrchestrator.StateChanged += ReceiverOrchestrator_StateChanged;
 
-        CreateTrayIcon();
-        var window = new MainWindow();
-        window.Icon = AppIconFactory.CreateWindowIcon();
-        MainWindow = window;
-        themeService.TrackWindow(window);
-        window.Show();
-        _ = InitializeReceiverAsync();
+            CreateTrayIcon();
+            var window = new MainWindow();
+            window.Icon = AppIconFactory.CreateWindowIcon();
+            MainWindow = window;
+            themeService.TrackWindow(window);
+            window.Show();
+            _ = InitializeReceiverAsync();
+        }
+        catch (Exception exception)
+        {
+            LogFatalAndFlush("Desktop receiver startup failed", exception);
+            throw;
+        }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        try
+        {
+            logger.LogInformation("Desktop receiver exited normally exitCode={ExitCode}", e.ApplicationExitCode);
+            diagnostics.Dispose();
+        }
+        finally
+        {
+            DispatcherUnhandledException -= App_DispatcherUnhandledException;
+            AppDomain.CurrentDomain.UnhandledException -= CurrentDomain_UnhandledException;
+            TaskScheduler.UnobservedTaskException -= TaskScheduler_UnobservedTaskException;
+            base.OnExit(e);
+        }
     }
 
     internal void HandleWindowClosing(CancelEventArgs e)
@@ -211,8 +256,9 @@ public partial class App : System.Windows.Application
                 ShowNotification("Receiving paused", "Start again from MB Photos or the notification area.", Forms.ToolTipIcon.Info);
             }
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            logger.LogError(exception, "Notification-area receiver action failed");
             ShowNotification("Receiver action failed", "Open MB Photos and try again.", Forms.ToolTipIcon.Error);
         }
     }
@@ -221,6 +267,24 @@ public partial class App : System.Windows.Application
 
     private void ReceiverOrchestrator_StateChanged(object? sender, ReceiverOrchestrationSnapshot state)
     {
+        var previousState = Interlocked.Exchange(ref lastLoggedPresentationState, (int)state.State);
+        if (previousState != (int)state.State)
+        {
+            logger.LogInformation(
+                "Receiver presentation changed state={State} generation={Generation} revision={Revision}",
+                state.State,
+                state.Generation,
+                state.Revision);
+        }
+        if (state.Error is not null)
+        {
+            logger.LogError(
+                state.Error,
+                "Receiver presentation reported an error state={State} generation={Generation}",
+                state.State,
+                state.Generation);
+        }
+
         _ = Dispatcher.BeginInvoke(new Action(() =>
         {
             if (state.Revision < appliedTrayStateRevision)
@@ -299,6 +363,11 @@ public partial class App : System.Windows.Application
 
         if (activity.ErrorMessage is not null)
         {
+            logger.LogWarning(
+                "Transfer activity reported an error jobId={JobId} state={State} generation={Generation}",
+                activity.JobId,
+                activity.State,
+                envelope.Generation);
             ShowNotification("Transfer needs attention", "Open MB Photos to see what you can do next.", Forms.ToolTipIcon.Error);
         }
 
@@ -311,6 +380,12 @@ public partial class App : System.Windows.Application
             {
                 return;
             }
+
+            logger.LogInformation(
+                "Transfer reached terminal state jobId={JobId} state={State} generation={Generation}",
+                activity.JobId,
+                activity.State,
+                envelope.Generation);
 
             if (activity.State == "completed")
             {
@@ -360,9 +435,49 @@ public partial class App : System.Windows.Application
         }
         catch (Exception exception)
         {
-            System.Diagnostics.Debug.WriteLine($"Automatic receiver startup failed: {exception}");
+            logger.LogError(exception, "Automatic receiver startup failed");
             ShowMainWindow();
             ShowNotification("Receiver could not start", "Open MB Photos to retry or choose another folder.", Forms.ToolTipIcon.Error);
+        }
+    }
+
+    private void App_DispatcherUnhandledException(
+        object sender,
+        DispatcherUnhandledExceptionEventArgs e) =>
+        LogFatalAndFlush("Unhandled WPF dispatcher exception", e.Exception);
+
+    private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        var exception = e.ExceptionObject as Exception;
+        LogFatalAndFlush(
+            e.IsTerminating
+                ? "Unhandled process exception; runtime is terminating"
+                : "Unhandled process exception",
+            exception);
+    }
+
+    private void TaskScheduler_UnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        logger.LogError(e.Exception, "Unobserved background task exception");
+        FlushDiagnosticsBestEffort();
+        e.SetObserved();
+    }
+
+    private void LogFatalAndFlush(string message, Exception? exception)
+    {
+        logger.LogCritical(exception, "{FatalMessage}", message);
+        FlushDiagnosticsBestEffort();
+    }
+
+    private void FlushDiagnosticsBestEffort()
+    {
+        try
+        {
+            _ = diagnostics.FlushAsync().Wait(TimeSpan.FromSeconds(3));
+        }
+        catch
+        {
+            // Fatal error reporting cannot safely throw another exception.
         }
     }
 }

@@ -15,10 +15,38 @@ public sealed record VariantExportResult(
 /// <summary>Exports an available representation as a verified exact byte copy.</summary>
 public sealed class VariantExportService
 {
-    public async Task<VariantExportResult> ExportAsync(
+    public Task<VariantExportResult> ExportAsync(
         PortableLibraryFile file,
         string targetDirectory,
+        CancellationToken cancellationToken = default) =>
+        ExportAsync(file, targetDirectory, explicitTargetPath: null, cancellationToken);
+
+    public Task<VariantExportResult> ExportToPathAsync(
+        PortableLibraryFile file,
+        string targetPath,
         CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(targetPath))
+        {
+            throw new ArgumentException("An export filename is required.", nameof(targetPath));
+        }
+
+        var fullTargetPath = Path.GetFullPath(targetPath);
+        var targetDirectory = Path.GetDirectoryName(fullTargetPath);
+        if (string.IsNullOrWhiteSpace(targetDirectory) ||
+            string.IsNullOrWhiteSpace(Path.GetFileName(fullTargetPath)))
+        {
+            throw new ArgumentException("A complete export filename is required.", nameof(targetPath));
+        }
+
+        return ExportAsync(file, targetDirectory, fullTargetPath, cancellationToken);
+    }
+
+    private async Task<VariantExportResult> ExportAsync(
+        PortableLibraryFile file,
+        string targetDirectory,
+        string? explicitTargetPath,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(file);
         if (string.IsNullOrWhiteSpace(targetDirectory))
@@ -41,17 +69,26 @@ public sealed class VariantExportService
         Directory.CreateDirectory(directory);
         EnsureResolvedOutsideLibrary(file.LibraryRoot, directory);
         var baseName = SafeLeafName(file.Catalog.OriginalFilename, file.FileId);
-        var targetPath = Path.Combine(directory, baseName);
+        var targetPath = explicitTargetPath ?? Path.Combine(directory, baseName);
+        var replaceExistingTarget = explicitTargetPath is not null && File.Exists(targetPath);
         if (File.Exists(targetPath))
         {
+            EnsureDestinationFileIsNotLink(targetPath);
             if (await IsExactAsync(targetPath, byteCount, sha256, cancellationToken))
             {
                 return new VariantExportResult(file.AssetId, file.FileId, targetPath, byteCount, sha256, true);
             }
-            targetPath = AllocateCollisionPath(directory, baseName, file.FileId);
+            if (explicitTargetPath is null)
+            {
+                targetPath = AllocateCollisionPath(directory, baseName, file.FileId);
+            }
         }
         else if (Directory.Exists(targetPath))
         {
+            if (explicitTargetPath is not null)
+            {
+                throw new IOException("The selected export filename is a folder.");
+            }
             targetPath = AllocateCollisionPath(directory, baseName, file.FileId);
         }
 
@@ -81,7 +118,12 @@ public sealed class VariantExportService
                 output.Flush(true);
             }
             await RequireExactAsync(stagingPath, byteCount, sha256, cancellationToken);
-            File.Move(stagingPath, targetPath, false);
+            EnsureResolvedOutsideLibrary(file.LibraryRoot, directory);
+            if (replaceExistingTarget)
+            {
+                EnsureDestinationFileIsNotLink(targetPath);
+            }
+            File.Move(stagingPath, targetPath, replaceExistingTarget);
             ApplyCaptureTimestamp(targetPath, file.Catalog.CaptureDate);
             return new VariantExportResult(file.AssetId, file.FileId, targetPath, byteCount, sha256, false);
         }
@@ -139,6 +181,14 @@ public sealed class VariantExportService
             }
         }
         throw new IOException("No deterministic export filename is available.");
+    }
+
+    private static void EnsureDestinationFileIsNotLink(string targetPath)
+    {
+        if ((File.GetAttributes(targetPath) & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new InvalidOperationException("The selected export filename is a filesystem link.");
+        }
     }
 
     private static void EnsureOutsideLibrary(string libraryRoot, string targetDirectory)

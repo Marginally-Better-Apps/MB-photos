@@ -10,5 +10,8 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/MBPhotos.Receiver.Wpf/MBPhotos.Receiver.Wpf.csproj" />
+    <None Include="../../src/MBPhotos.Receiver.Wpf/MainWindow.xaml"
+          Link="Fixtures/MainWindow.xaml"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

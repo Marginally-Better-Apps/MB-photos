@@ -48,6 +48,95 @@
         <Style x:Key="ReceiverStatusPillStyle" TargetType="Border" BasedOn="{StaticResource StatusPillStyle}">
             <Setter Property="Background" Value="{DynamicResource AccentSoftBrush}" />
         </Style>
+        <Style x:Key="LibraryVariantButtonStyle" TargetType="RadioButton">
+            <Setter Property="MinHeight" Value="42" />
+            <Setter Property="MinWidth" Value="0" />
+            <Setter Property="Margin" Value="4" />
+            <Setter Property="Padding" Value="14,8" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="FontSize" Value="14" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+            <Setter Property="Background" Value="{DynamicResource ControlBackgroundBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="FocusVisualStyle" Value="{StaticResource ModernFocusVisualStyle}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="VariantBorder"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="{DynamicResource ControlCornerRadius}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="VariantBorder" Property="Background" Value="{DynamicResource ControlHoverBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="VariantBorder" Property="Opacity" Value="0.72" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="VariantBorder" Property="Background" Value="{DynamicResource AccentSoftBrush}" />
+                                <Setter TargetName="VariantBorder" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="LibraryTimeFilterButtonStyle" TargetType="RadioButton">
+            <Setter Property="MinHeight" Value="30" />
+            <Setter Property="MinWidth" Value="0" />
+            <Setter Property="Margin" Value="0,0,6,6" />
+            <Setter Property="Padding" Value="11,5" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
+            <Setter Property="Background" Value="{DynamicResource ControlBackgroundBrush}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="FocusVisualStyle" Value="{StaticResource ModernFocusVisualStyle}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="TimeFilterBorder"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="15"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="TimeFilterBorder" Property="Background" Value="{DynamicResource ControlHoverBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="TimeFilterBorder" Property="Opacity" Value="0.72" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="TimeFilterBorder" Property="Background" Value="{DynamicResource AccentSoftBrush}" />
+                                <Setter TargetName="TimeFilterBorder" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+                                <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
 
         <DataTemplate x:Key="SetupTemplate">
             <Border Style="{StaticResource HeroCardStyle}" MaxWidth="650" Padding="54,50">
@@ -221,8 +310,9 @@
                         </Grid>
                     </Border>
                     <StackPanel Grid.Row="2">
-                        <ProgressBar Height="9" Minimum="0" Maximum="{Binding ProgressMaximum}"
-                                     Value="{Binding ProgressValue}" IsIndeterminate="{Binding IsProgressIndeterminate}"
+                        <ProgressBar Height="9" Minimum="0" Maximum="{Binding ProgressMaximum, Mode=OneWay}"
+                                     Value="{Binding ProgressValue, Mode=OneWay}"
+                                     IsIndeterminate="{Binding IsProgressIndeterminate, Mode=OneWay}"
                                      Style="{StaticResource ModernProgressBarStyle}" />
                         <TextBlock Text="{Binding ProgressText}" Style="{StaticResource CaptionTextStyle}"
                                    AutomationProperties.LiveSetting="Polite"
@@ -366,7 +456,8 @@
                         AutomationProperties.Name="More options"
                         ToolTip="More options" Click="OverflowButton_Click">
                     <Button.ContextMenu>
-                        <ContextMenu x:Name="OverflowMenu">
+                        <ContextMenu x:Name="OverflowMenu"
+                                     FontFamily="Segoe UI Variable Text, Segoe UI">
                             <MenuItem x:Name="CopyPairingLinkMenuItem" Header="Copy pairing link"
                                       Click="CopyPairingLink_Click" />
                             <Separator />
@@ -382,9 +473,9 @@
         </Border>
 
         <Grid Grid.Row="1">
-            <ScrollViewer x:Name="ReceiverPage" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                <ScrollViewer.Style>
-                    <Style TargetType="ScrollViewer">
+            <Grid x:Name="ReceiverPage" ClipToBounds="True">
+                <Grid.Style>
+                    <Style TargetType="Grid">
                         <Setter Property="Visibility" Value="Collapsed" />
                         <Style.Triggers>
                             <DataTrigger Binding="{Binding Page}" Value="{x:Static local:ReceiverShellPage.Receiver}">
@@ -392,48 +483,48 @@
                             </DataTrigger>
                         </Style.Triggers>
                     </Style>
-                </ScrollViewer.Style>
+                </Grid.Style>
                 <Grid Margin="32,30,32,38">
-                    <ContentControl Content="{Binding}" HorizontalAlignment="Center" VerticalAlignment="Center"
-                                    AutomationProperties.Name="{Binding StatusText}"
-                                    AutomationProperties.LiveSetting="Polite">
-                        <ContentControl.Style>
-                            <Style TargetType="ContentControl">
-                                <Setter Property="ContentTemplate" Value="{StaticResource SetupTemplate}" />
-                                <Style.Triggers>
-                                    <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Starting}">
-                                        <Setter Property="ContentTemplate" Value="{StaticResource StartingTemplate}" />
-                                    </DataTrigger>
-                                    <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Ready}">
-                                        <Setter Property="ContentTemplate" Value="{StaticResource ReadyTemplate}" />
-                                    </DataTrigger>
-                                    <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Connected}">
-                                        <Setter Property="ContentTemplate" Value="{StaticResource ConnectedTemplate}" />
-                                    </DataTrigger>
-                                    <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Transferring}">
-                                        <Setter Property="ContentTemplate" Value="{StaticResource TransferringTemplate}" />
-                                    </DataTrigger>
-                                    <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Finalizing}">
-                                        <Setter Property="ContentTemplate" Value="{StaticResource FinalizingTemplate}" />
-                                    </DataTrigger>
-                                    <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Paused}">
-                                        <Setter Property="ContentTemplate" Value="{StaticResource PausedTemplate}" />
-                                    </DataTrigger>
-                                    <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Error}">
-                                        <Setter Property="ContentTemplate" Value="{StaticResource ErrorTemplate}" />
-                                    </DataTrigger>
-                                </Style.Triggers>
-                            </Style>
-                        </ContentControl.Style>
-                    </ContentControl>
+                    <Viewbox Stretch="Uniform" StretchDirection="DownOnly">
+                        <ContentControl Content="{Binding}" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                        AutomationProperties.Name="{Binding StatusText}"
+                                        AutomationProperties.LiveSetting="Polite">
+                            <ContentControl.Style>
+                                <Style TargetType="ContentControl">
+                                    <Setter Property="ContentTemplate" Value="{StaticResource SetupTemplate}" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Starting}">
+                                            <Setter Property="ContentTemplate" Value="{StaticResource StartingTemplate}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Ready}">
+                                            <Setter Property="ContentTemplate" Value="{StaticResource ReadyTemplate}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Connected}">
+                                            <Setter Property="ContentTemplate" Value="{StaticResource ConnectedTemplate}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Transferring}">
+                                            <Setter Property="ContentTemplate" Value="{StaticResource TransferringTemplate}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Finalizing}">
+                                            <Setter Property="ContentTemplate" Value="{StaticResource FinalizingTemplate}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Paused}">
+                                            <Setter Property="ContentTemplate" Value="{StaticResource PausedTemplate}" />
+                                        </DataTrigger>
+                                        <DataTrigger Binding="{Binding State}" Value="{x:Static local:ReceiverPresentationState.Error}">
+                                            <Setter Property="ContentTemplate" Value="{StaticResource ErrorTemplate}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </ContentControl.Style>
+                        </ContentControl>
+                    </Viewbox>
                 </Grid>
-            </ScrollViewer>
+            </Grid>
 
-            <ScrollViewer x:Name="LibraryPage"
-                          HorizontalScrollBarVisibility="Auto"
-                          VerticalScrollBarVisibility="Disabled">
-                <ScrollViewer.Style>
-                    <Style TargetType="ScrollViewer">
+            <Grid x:Name="LibraryPage" ClipToBounds="True">
+                <Grid.Style>
+                    <Style TargetType="Grid">
                         <Setter Property="Visibility" Value="Collapsed" />
                         <Style.Triggers>
                             <DataTrigger Binding="{Binding Page}" Value="{x:Static local:ReceiverShellPage.Library}">
@@ -441,13 +532,13 @@
                             </DataTrigger>
                         </Style.Triggers>
                     </Style>
-                </ScrollViewer.Style>
-            <Grid Margin="30,24,30,30" MinWidth="738">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="*" />
-                </Grid.RowDefinitions>
-                <Grid Grid.Row="0" Margin="2,0,2,18">
+                </Grid.Style>
+                <Grid Margin="30,24,30,30">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0" Margin="2,0,2,18">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
@@ -459,20 +550,60 @@
                     <WrapPanel Grid.Column="1" VerticalAlignment="Center">
                         <Button x:Name="ReloadLibraryButton" Content="Refresh" Style="{StaticResource QuietButtonStyle}"
                                 Click="ReloadLibrary_Click" />
+                        <Button x:Name="OpenLibraryFolderButton" Content="Open Photos Folder"
+                                Style="{StaticResource SecondaryButtonStyle}" Margin="8,0,0,0"
+                                AutomationProperties.Name="Open master photos folder"
+                                ToolTip="Open the master photos folder in File Explorer"
+                                Click="OpenMasterFolder_Click" />
                         <Button x:Name="CloseLibraryButton" Content="Back to Receiver" Style="{StaticResource SecondaryButtonStyle}"
                                 Margin="8,0,0,0" Click="CloseLibrary_Click" />
                     </WrapPanel>
-                </Grid>
-                <Grid Grid.Row="1">
+                    </Grid>
+                    <Grid Grid.Row="1">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="5*" MinWidth="340" />
+                        <ColumnDefinition Width="5*" />
                         <ColumnDefinition Width="18" />
-                        <ColumnDefinition Width="6*" MinWidth="380" />
+                        <ColumnDefinition Width="6*" />
                     </Grid.ColumnDefinitions>
-                    <Border Grid.Column="0" Style="{StaticResource CardStyle}" Padding="7">
+                    <Grid Grid.Column="0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <WrapPanel x:Name="LibraryTimeFilterPanel" Margin="2,0,2,6"
+                                   Visibility="Collapsed"
+                                   AutomationProperties.Name="Filter library by photo date">
+                            <RadioButton x:Name="AllDatesFilterButton" Content="All" Tag="All"
+                                         GroupName="LibraryTimeFilter" IsChecked="True"
+                                         Style="{StaticResource LibraryTimeFilterButtonStyle}"
+                                         Click="LibraryTimeFilter_Click" />
+                            <RadioButton x:Name="TodayFilterButton" Content="Today" Tag="Today"
+                                         GroupName="LibraryTimeFilter"
+                                         Style="{StaticResource LibraryTimeFilterButtonStyle}"
+                                         Click="LibraryTimeFilter_Click" />
+                            <RadioButton x:Name="ThisWeekFilterButton" Content="This week" Tag="ThisWeek"
+                                         GroupName="LibraryTimeFilter"
+                                         Style="{StaticResource LibraryTimeFilterButtonStyle}"
+                                         Click="LibraryTimeFilter_Click" />
+                            <RadioButton x:Name="ThisMonthFilterButton" Content="This month" Tag="ThisMonth"
+                                         GroupName="LibraryTimeFilter"
+                                         Style="{StaticResource LibraryTimeFilterButtonStyle}"
+                                         Click="LibraryTimeFilter_Click" />
+                            <RadioButton x:Name="ThisYearFilterButton" Content="This year" Tag="ThisYear"
+                                         GroupName="LibraryTimeFilter"
+                                         Style="{StaticResource LibraryTimeFilterButtonStyle}"
+                                         Click="LibraryTimeFilter_Click" />
+                            <RadioButton x:Name="EarlierFilterButton" Content="Earlier" Tag="Earlier"
+                                         GroupName="LibraryTimeFilter"
+                                         Style="{StaticResource LibraryTimeFilterButtonStyle}"
+                                         Click="LibraryTimeFilter_Click" />
+                        </WrapPanel>
+                    <Border Grid.Row="1" Style="{StaticResource CardStyle}" Padding="7">
                         <ListBox x:Name="LibraryAssetList" BorderThickness="0" Background="Transparent"
                                  SelectionChanged="LibraryAssetList_SelectionChanged"
                                  ScrollViewer.CanContentScroll="True"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                 ScrollViewer.VerticalScrollBarVisibility="Auto"
                                  VirtualizingPanel.IsVirtualizing="True"
                                  VirtualizingPanel.VirtualizationMode="Recycling">
                             <ListBox.ItemContainerStyle>
@@ -510,7 +641,14 @@
                                             <ColumnDefinition Width="*" />
                                         </Grid.ColumnDefinitions>
                                         <Border Width="88" Height="76" CornerRadius="12"
-                                                Background="{DynamicResource SurfaceSecondaryBrush}" ClipToBounds="True">
+                                                Background="{DynamicResource SurfaceSecondaryBrush}" ClipToBounds="True"
+                                                ContextMenuOpening="LibraryThumbnail_ContextMenuOpening">
+                                            <Border.ContextMenu>
+                                                <ContextMenu>
+                                                    <MenuItem Header="Copy Full-Quality Image"
+                                                              Click="CopyFullQualityImage_Click" />
+                                                </ContextMenu>
+                                            </Border.ContextMenu>
                                             <Grid>
                                                 <TextBlock Text="&#xE91B;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="24"
                                                            AutomationProperties.Name=""
@@ -533,73 +671,108 @@
                             </ListBox.ItemTemplate>
                         </ListBox>
                     </Border>
-                    <Border Grid.Column="2" Style="{StaticResource CardStyle}" Padding="24">
-                        <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="3*" MinHeight="230" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
-                            <Border Grid.Row="0" CornerRadius="18" Background="{DynamicResource SurfaceSecondaryBrush}"
-                                    ClipToBounds="True">
-                                <Grid>
-                                    <TextBlock Text="&#xE91B;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="48"
-                                               AutomationProperties.Name=""
-                                               Foreground="{DynamicResource TextTertiaryBrush}"
-                                               HorizontalAlignment="Center" VerticalAlignment="Center" />
-                                    <Image x:Name="LibraryPreviewImage" Stretch="Uniform" />
+                    </Grid>
+                    <Border Grid.Column="2" Style="{StaticResource CardStyle}" Padding="18" ClipToBounds="True">
+                            <Grid x:Name="LibraryDetailsLayout">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="*" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+                                <Border x:Name="LibraryPreviewContainer" Grid.Row="0" CornerRadius="18"
+                                        Background="{DynamicResource SurfaceSecondaryBrush}" ClipToBounds="True">
+                                    <Grid>
+                                        <TextBlock Text="&#xE91B;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" FontSize="48"
+                                                   AutomationProperties.Name=""
+                                                   Foreground="{DynamicResource TextTertiaryBrush}"
+                                                   HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                        <Image x:Name="LibraryPreviewImage" Stretch="Uniform"
+                                               StretchDirection="Both" />
+                                        <MediaElement x:Name="LibraryPreviewVideo" Visibility="Collapsed"
+                                                      LoadedBehavior="Manual" UnloadedBehavior="Stop"
+                                                      Stretch="Uniform" IsMuted="True" Volume="0"
+                                                      MediaOpened="LibraryPreviewVideo_MediaOpened"
+                                                      MediaEnded="LibraryPreviewVideo_MediaEnded"
+                                                      MediaFailed="LibraryPreviewVideo_MediaFailed" />
+                                        <Border x:Name="LibraryPreviewMessageBorder" Visibility="Collapsed"
+                                                HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                Padding="12,7" CornerRadius="10"
+                                                Background="{DynamicResource SurfaceElevatedBrush}">
+                                            <TextBlock x:Name="LibraryPreviewMessageText"
+                                                       Style="{StaticResource CaptionTextStyle}"
+                                                       TextAlignment="Center" />
+                                        </Border>
+                                    </Grid>
+                                </Border>
+                                <Grid Grid.Row="1" Margin="4,10,4,0">
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                                        <Button x:Name="SaveLibraryPreviewButton" Visibility="Collapsed"
+                                                Content="Save" Style="{StaticResource PrimaryButtonStyle}"
+                                                MinWidth="88" MinHeight="36" Padding="14,6" Margin="0"
+                                                AutomationProperties.Name="Save selected version"
+                                                Click="SaveLibraryPreview_Click" />
+                                        <Button x:Name="CopyLibraryPreviewButton" Visibility="Collapsed"
+                                                Content="Copy" Style="{StaticResource SecondaryButtonStyle}"
+                                                MinWidth="88" MinHeight="36" Padding="14,6" Margin="8,0,0,0"
+                                                AutomationProperties.Name="Copy selected full-quality image"
+                                                ToolTip="Copy the selected full-quality image"
+                                                Click="CopyLibraryPreview_Click" />
+                                    </StackPanel>
                                 </Grid>
-                            </Border>
-                            <StackPanel Grid.Row="1" Margin="0,20,0,0">
-                                <TextBlock x:Name="LibraryFilenameText" FontSize="21" FontWeight="SemiBold"
-                                           TextTrimming="CharacterEllipsis" />
-                                <TextBlock x:Name="LibraryDateText" Style="{StaticResource BodyTextStyle}" Margin="0,5,0,0" />
-                                <TextBlock x:Name="LibraryFlagsText" Foreground="{DynamicResource AccentBrush}"
-                                           FontSize="13" Margin="0,5,0,0" />
-                                <TextBlock x:Name="LibraryArchiveText" Visibility="Collapsed" />
-                            </StackPanel>
-                            <StackPanel Grid.Row="2" Margin="0,22,0,0">
-                                <TextBlock Text="Save a copy" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,8" />
-                                <WrapPanel>
-                                    <Button x:Name="ExportCurrentButton" Content="Current Version" Tag="CurrentMaster"
-                                            Style="{StaticResource SecondaryButtonStyle}" Click="ExportVariant_Click" />
-                                    <Button x:Name="ExportOriginalButton" Content="Original" Tag="RootOriginal"
-                                            Style="{StaticResource SecondaryButtonStyle}" Margin="8,0,0,0" Click="ExportVariant_Click" />
-                                    <Button x:Name="ExportCurrentMotionButton" Content="Live Photo Video" Tag="CurrentLiveMotion"
-                                            Style="{StaticResource SecondaryButtonStyle}" Margin="8,0,0,0" Click="ExportVariant_Click" />
-                                    <Button x:Name="ExportOriginalMotionButton" Content="Original Live Photo Video" Tag="OriginalLiveMotion"
-                                            Style="{StaticResource SecondaryButtonStyle}" Margin="8,8,0,0" Click="ExportVariant_Click" />
-                                </WrapPanel>
-                                <DockPanel Margin="0,12,0,0" LastChildFill="True">
-                                    <Button x:Name="ExportIndividualOriginalButton" DockPanel.Dock="Right"
-                                            Content="Save Selected" Style="{StaticResource SecondaryButtonStyle}"
-                                            Margin="8,0,0,0" Click="ExportIndividualOriginal_Click" />
-                                    <ComboBox x:Name="IndividualOriginalsComboBox" MinHeight="38" Padding="9,5"
-                                              VerticalContentAlignment="Center" DisplayMemberPath="Label" />
-                                </DockPanel>
-                            </StackPanel>
-                            <Grid Grid.Row="3" Margin="0,17,0,0">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock x:Name="LibraryExportStatusText" VerticalAlignment="Center"
-                                           Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" />
-                                <Button x:Name="OpenMasterFolderButton" Grid.Column="1" Content="Open Photos Folder"
-                                        Style="{StaticResource QuietButtonStyle}" Click="OpenMasterFolder_Click" />
+                                <StackPanel Grid.Row="2" Margin="0,16,0,0">
+                                    <TextBlock x:Name="LibraryFilenameText" FontSize="21" FontWeight="SemiBold"
+                                               TextTrimming="CharacterEllipsis" />
+                                    <TextBlock x:Name="LibraryDateText" Style="{StaticResource BodyTextStyle}" Margin="0,5,0,0" />
+                                    <TextBlock x:Name="LibraryFlagsText" Foreground="{DynamicResource AccentBrush}"
+                                               FontSize="13" Margin="0,5,0,0" />
+                                    <TextBlock x:Name="LibraryArchiveText" Visibility="Collapsed" />
+                                </StackPanel>
+                                <StackPanel x:Name="VersionSelectionPanel" Grid.Row="3"
+                                            Visibility="Collapsed" Margin="0,22,0,0">
+                                    <TextBlock Text="Preview a version" FontSize="15" FontWeight="SemiBold" Margin="4,0,4,4" />
+                                    <UniformGrid Columns="2">
+                                        <RadioButton x:Name="CurrentVersionButton" Content="Current Version" Tag="CurrentMaster"
+                                                     GroupName="LibraryVersion" Style="{StaticResource LibraryVariantButtonStyle}"
+                                                     Click="PreviewVariant_Click" />
+                                        <RadioButton x:Name="OriginalVersionButton" Content="Original" Tag="RootOriginal"
+                                                     GroupName="LibraryVersion" Style="{StaticResource LibraryVariantButtonStyle}"
+                                                     Click="PreviewVariant_Click" />
+                                        <RadioButton x:Name="CurrentMotionVersionButton" Content="Live Photo Video" Tag="CurrentLiveMotion"
+                                                     GroupName="LibraryVersion" Style="{StaticResource LibraryVariantButtonStyle}"
+                                                     Click="PreviewVariant_Click" />
+                                        <RadioButton x:Name="OriginalMotionVersionButton" Content="Original Live Photo Video" Tag="OriginalLiveMotion"
+                                                     GroupName="LibraryVersion" Style="{StaticResource LibraryVariantButtonStyle}"
+                                                     Click="PreviewVariant_Click" />
+                                    </UniformGrid>
+                                    <StackPanel x:Name="AdditionalOriginalsPanel" Visibility="Collapsed" Margin="4,8,4,0">
+                                        <TextBlock Text="Additional originals" Style="{StaticResource CaptionTextStyle}" Margin="0,0,0,6" />
+                                        <ComboBox x:Name="IndividualOriginalsComboBox" MinHeight="38" Padding="9,5"
+                                                  VerticalContentAlignment="Center" DisplayMemberPath="Label"
+                                                  SelectionChanged="IndividualOriginalsComboBox_SelectionChanged" />
+                                    </StackPanel>
+                                </StackPanel>
+                                <Grid Grid.Row="4" Margin="4,17,4,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="LibraryExportStatusText" VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextSecondaryBrush}" FontSize="12" />
+                                    <Button x:Name="OpenMasterFolderButton" Grid.Column="1" Content="Open Photos Folder"
+                                            Style="{StaticResource QuietButtonStyle}" Margin="12,0,0,0"
+                                            Click="OpenMasterFolder_Click" />
+                                </Grid>
                             </Grid>
-                        </Grid>
-                        </ScrollViewer>
                     </Border>
+                    </Grid>
                 </Grid>
             </Grid>
-            </ScrollViewer>
 
-            <ScrollViewer x:Name="SettingsPage" VerticalScrollBarVisibility="Auto">
-                <ScrollViewer.Style>
-                    <Style TargetType="ScrollViewer">
+            <Grid x:Name="SettingsPage" ClipToBounds="True">
+                <Grid.Style>
+                    <Style TargetType="Grid">
                         <Setter Property="Visibility" Value="Collapsed" />
                         <Style.Triggers>
                             <DataTrigger Binding="{Binding Page}" Value="{x:Static local:ReceiverShellPage.Settings}">
@@ -607,8 +780,10 @@
                             </DataTrigger>
                         </Style.Triggers>
                     </Style>
-                </ScrollViewer.Style>
-                <StackPanel Margin="32,28,32,40" MaxWidth="760" HorizontalAlignment="Center">
+                </Grid.Style>
+                <Grid Margin="32,28,32,40">
+                    <Viewbox Stretch="Uniform" StretchDirection="DownOnly">
+                        <StackPanel Width="760" HorizontalAlignment="Center">
                     <TextBlock Text="Settings" Style="{StaticResource PageTitleStyle}" />
                     <TextBlock Text="Library, support, and app information." Style="{StaticResource BodyTextStyle}" Margin="0,6,0,22" />
                     <Border Style="{StaticResource CardStyle}" Padding="24" Margin="0,0,0,16">
@@ -656,8 +831,10 @@
                             <TextBlock x:Name="AppVersionText" Style="{StaticResource CaptionTextStyle}" Margin="0,12,0,0" />
                         </StackPanel>
                     </Border>
-                </StackPanel>
-            </ScrollViewer>
+                        </StackPanel>
+                    </Viewbox>
+                </Grid>
+            </Grid>
         </Grid>
     </Grid>
 </Window>

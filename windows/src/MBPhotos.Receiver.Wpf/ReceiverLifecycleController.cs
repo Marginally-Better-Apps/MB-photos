@@ -1,3 +1,4 @@
+using MBPhotos.Receiver.Diagnostics;
 using MBPhotos.Receiver.Hosting;
 using MBPhotos.Receiver.Transfer;
 using System.Windows.Media.Imaging;
@@ -33,6 +34,7 @@ internal sealed class ReceiverLifecycleController : IAsyncDisposable
     private readonly object sync = new();
     private readonly SemaphoreSlim operationGate = new(1, 1);
     private readonly ReceiverActivityFeed activityFeed;
+    private readonly RedactingFileLoggerProvider diagnostics;
     private readonly ReceiverLifecycleGenerationFence generationFence = new();
 
     private ReceiverLifecycleSnapshot snapshot = new(ReceiverLifecycleState.Stopped, 0, null);
@@ -40,9 +42,12 @@ internal sealed class ReceiverLifecycleController : IAsyncDisposable
     private Task<ReceiverServer>? startTask;
     private EventHandler<ReceiverActivity>? activityHandler;
 
-    public ReceiverLifecycleController(ReceiverActivityFeed activityFeed)
+    public ReceiverLifecycleController(
+        ReceiverActivityFeed activityFeed,
+        RedactingFileLoggerProvider diagnostics)
     {
-        this.activityFeed = activityFeed;
+        this.activityFeed = activityFeed ?? throw new ArgumentNullException(nameof(activityFeed));
+        this.diagnostics = diagnostics ?? throw new ArgumentNullException(nameof(diagnostics));
     }
 
     public event EventHandler<ReceiverLifecycleSnapshot>? StateChanged;
@@ -101,6 +106,7 @@ internal sealed class ReceiverLifecycleController : IAsyncDisposable
                 () => ReceiverServer.StartAsync(
                     destinationPath,
                     allowInitialize,
+                    diagnosticProvider: diagnostics,
                     cancellationToken: localCancellation.Token),
                 CancellationToken.None);
             lock (sync)

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
@@ -134,7 +135,8 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
             message.Length <= MaximumMessageCharacters
                 ? message
                 : message[..MaximumMessageCharacters] + " [truncated]",
-            exception?.GetType().Name);
+            exception?.GetType().Name,
+            FormatException(exception));
 
         if (commandSlots.Wait(0))
         {
@@ -286,6 +288,7 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
                         LogLevel.Warning,
                         new EventId(0, "LowPriorityOverflow"),
                         $"Dropped {dropped:N0} low-priority diagnostic events because the bounded log queue was full.",
+                        null,
                         null));
                 }
 
@@ -294,8 +297,10 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
                     try
                     {
                         var safe = Redact(entry.Message);
-                        var exceptionName = entry.ExceptionName is null ? string.Empty : $" exception={entry.ExceptionName}";
-                        var line = $"{entry.Timestamp:O} {entry.Level} {entry.Category} event={entry.EventId.Id} {safe}{exceptionName}";
+                        var exceptionDetails = entry.ExceptionDetails is null
+                            ? string.Empty
+                            : $" {Redact(entry.ExceptionDetails)}";
+                        var line = $"{entry.Timestamp:O} {entry.Level} {entry.Category} event={entry.EventId.Id} {safe}{exceptionDetails}";
                         (stream, writer) = await WriteLineAsync(stream, writer, line).ConfigureAwait(false);
                         entriesSinceFlush++;
                         lastWriteFailure = null;
@@ -421,13 +426,59 @@ public sealed class RedactingFileLoggerProvider : ILoggerProvider, IAsyncDisposa
         return redacted;
     }
 
+    private static string? FormatException(Exception? exception)
+    {
+        if (exception is null)
+        {
+            return null;
+        }
+
+        var details = new StringBuilder();
+        var current = exception;
+        var depth = 0;
+        while (current is not null && depth < 8)
+        {
+            if (depth > 0)
+            {
+                details.Append(" inner=");
+            }
+
+            details.Append(current.GetType().FullName ?? current.GetType().Name);
+            details.Append(" hresult=0x");
+            details.Append(current.HResult.ToString("X8"));
+
+            // File names, paths, tokens, and user-supplied values often appear in
+            // exception messages. Method-only frames retain the actionable crash
+            // location without recording that private content.
+            var stack = new StackTrace(current, false).ToString().Trim();
+            if (stack.Length > 0)
+            {
+                details.Append(" stack=");
+                details.Append(stack.Replace(Environment.NewLine, " | ", StringComparison.Ordinal));
+            }
+
+            current = current.InnerException;
+            depth++;
+        }
+
+        if (current is not null)
+        {
+            details.Append(" inner=[truncated]");
+        }
+
+        return details.Length <= MaximumMessageCharacters
+            ? details.ToString()
+            : details.ToString(0, MaximumMessageCharacters) + " [truncated]";
+    }
+
     private sealed record LogEntry(
         DateTimeOffset Timestamp,
         string Category,
         LogLevel Level,
         EventId EventId,
         string Message,
-        string? ExceptionName);
+        string? ExceptionName,
+        string? ExceptionDetails);
 
     private sealed record LogCommand(LogEntry? Entry, TaskCompletionSource? FlushCompletion);
 

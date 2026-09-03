@@ -1,7 +1,9 @@
 using System.IO;
 using System.Text.Json;
+using System.Xml.Linq;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using MBPhotos.Receiver.Library;
 using MBPhotos.Receiver.Models;
 using MBPhotos.Receiver.Transfer;
 
@@ -18,6 +20,12 @@ internal static class Program
         var tests = new (string Name, Func<Task> Run)[]
         {
             ("presentation state copy and preview fencing", TestPresentationStateAndPreviewFencingAsync),
+            ("transfer progress bindings remain one-way", TestTransferProgressBindingsAsync),
+            ("window pages resize without page scrollbars", TestAdaptivePageLayoutAsync),
+            ("library dates sort and filter", TestLibraryDateSortAndFilterAsync),
+            ("thumbnail copy is full-quality and image-only", TestThumbnailCopySelectionAsync),
+            ("library saves to the chosen filename", TestLibrarySaveAsAsync),
+            ("duplicate library versions collapse", TestDuplicateLibraryVersionsCollapseAsync),
             ("missing settings are treated as first launch", TestMissingSettingsAsync),
             ("corrupt settings are ignored", TestCorruptSettingsAsync),
             ("valid versioned settings load", TestValidSettingsAsync),
@@ -130,6 +138,431 @@ internal static class Program
         model.Apply(Snapshot(ReceiverPresentationState.Ready, generation: 44, libraryRoot));
         True(model.IsReceiverPage, "leaving library did not restore the receiver page");
 
+        return Task.CompletedTask;
+    }
+
+    private static Task TestTransferProgressBindingsAsync()
+    {
+        var document = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "Fixtures", "MainWindow.xaml"));
+        XNamespace presentation = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+        var template = document
+            .Descendants(presentation + "DataTemplate")
+            .Single(element => string.Equals(
+                (string?)element.Attribute(xaml + "Key"),
+                "TransferringTemplate",
+                StringComparison.Ordinal));
+        var progress = template
+            .Descendants(presentation + "ProgressBar")
+            .Single(element => ((string?)element.Attribute("Value"))?.Contains(
+                "ProgressValue",
+                StringComparison.Ordinal) == true);
+
+        Equal(
+            "{Binding ProgressMaximum, Mode=OneWay}",
+            (string?)progress.Attribute("Maximum"),
+            "transfer progress maximum binding");
+        Equal(
+            "{Binding ProgressValue, Mode=OneWay}",
+            (string?)progress.Attribute("Value"),
+            "transfer progress value binding");
+        Equal(
+            "{Binding IsProgressIndeterminate, Mode=OneWay}",
+            (string?)progress.Attribute("IsIndeterminate"),
+            "transfer indeterminate binding");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestAdaptivePageLayoutAsync()
+    {
+        var document = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "Fixtures", "MainWindow.xaml"));
+        XNamespace presentation = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+        XNamespace xaml = "http://schemas.microsoft.com/winfx/2006/xaml";
+
+        XElement NamedElement(string name) => document
+            .Descendants()
+            .Single(element => string.Equals(
+                (string?)element.Attribute(xaml + "Name"),
+                name,
+                StringComparison.Ordinal));
+
+        foreach (var pageName in new[] { "ReceiverPage", "LibraryPage", "SettingsPage" })
+        {
+            var page = NamedElement(pageName);
+            Equal(presentation + "Grid", page.Name, $"{pageName} layout root");
+            False(
+                page.Descendants(presentation + "ScrollViewer").Any(),
+                $"{pageName} contains a page-level scroll viewer");
+        }
+
+        foreach (var pageName in new[] { "ReceiverPage", "SettingsPage" })
+        {
+            var viewbox = NamedElement(pageName).Descendants(presentation + "Viewbox").Single();
+            Equal("Uniform", (string?)viewbox.Attribute("Stretch"), $"{pageName} resize mode");
+            Equal("DownOnly", (string?)viewbox.Attribute("StretchDirection"), $"{pageName} resize direction");
+        }
+        False(
+            NamedElement("LibraryPage").Descendants(presentation + "Viewbox").Any(),
+            "library details are still capped by a viewbox");
+
+        var preview = NamedElement("LibraryPreviewImage");
+        Equal("Uniform", (string?)preview.Attribute("Stretch"), "library preview resize mode");
+        Equal("Both", (string?)preview.Attribute("StretchDirection"), "library preview resize direction");
+        var previewContainer = NamedElement("LibraryPreviewContainer");
+        var detailsLayout = NamedElement("LibraryDetailsLayout");
+        Same(detailsLayout, previewContainer.Parent, "preview is outside the flexible details layout");
+        Equal<string?>(null, (string?)previewContainer.Attribute("Height"), "library preview still has a fixed height");
+        Equal<string?>(null, (string?)previewContainer.Attribute("MaxWidth"), "library preview still has a maximum width");
+        Equal<string?>(null, (string?)previewContainer.Attribute("MaxHeight"), "library preview still has a maximum height");
+        var firstDetailsRow = detailsLayout
+            .Element(presentation + "Grid.RowDefinitions")?
+            .Elements(presentation + "RowDefinition")
+            .FirstOrDefault();
+        NotNull(firstDetailsRow, "library details rows");
+        Equal("*", (string?)firstDetailsRow!.Attribute("Height"), "preview does not receive remaining height");
+
+        var variantStyle = document
+            .Descendants(presentation + "Style")
+            .Single(element => string.Equals(
+                (string?)element.Attribute(xaml + "Key"),
+                "LibraryVariantButtonStyle",
+                StringComparison.Ordinal));
+        var disabledTrigger = variantStyle
+            .Descendants(presentation + "Trigger")
+            .Single(element =>
+                string.Equals((string?)element.Attribute("Property"), "IsEnabled", StringComparison.Ordinal) &&
+                string.Equals((string?)element.Attribute("Value"), "False", StringComparison.Ordinal));
+        True(
+            disabledTrigger.Descendants(presentation + "Setter").Any(element =>
+                string.Equals((string?)element.Attribute("Property"), "Visibility", StringComparison.Ordinal) &&
+                string.Equals((string?)element.Attribute("Value"), "Collapsed", StringComparison.Ordinal)),
+            "disabled library versions remain visible");
+
+        foreach (var (name, tag) in new[]
+                 {
+                     ("CurrentVersionButton", "CurrentMaster"),
+                     ("OriginalVersionButton", "RootOriginal"),
+                     ("CurrentMotionVersionButton", "CurrentLiveMotion"),
+                     ("OriginalMotionVersionButton", "OriginalLiveMotion"),
+                 })
+        {
+            var button = NamedElement(name);
+            Equal(presentation + "RadioButton", button.Name, $"{name} control type");
+            Equal(tag, (string?)button.Attribute("Tag"), $"{name} variant tag");
+            Equal("PreviewVariant_Click", (string?)button.Attribute("Click"), $"{name} selection action");
+            Equal(presentation + "UniformGrid", button.Parent?.Name, $"{name} alignment container");
+        }
+
+        var previewPanel = preview.Parent!;
+        var saveButton = NamedElement("SaveLibraryPreviewButton");
+        False(
+            document.Descendants().Any(element =>
+                string.Equals(
+                    (string?)element.Attribute(xaml + "Name"),
+                    "LibraryPreviewSelectionBadge",
+                    StringComparison.Ordinal)),
+            "preview selection label remains visible");
+        False(ReferenceEquals(previewPanel, saveButton.Parent), "preview save button still overlays the media");
+        var previewActionPanel = saveButton.Parent;
+        NotNull(previewActionPanel, "preview action panel");
+        Equal(presentation + "StackPanel", previewActionPanel!.Name, "preview action layout");
+        Equal("Horizontal", (string?)previewActionPanel.Attribute("Orientation"), "preview action orientation");
+        Equal("Center", (string?)previewActionPanel.Attribute("HorizontalAlignment"), "preview action alignment");
+        Equal("1", (string?)previewActionPanel.Parent?.Attribute("Grid.Row"), "preview action row");
+        Equal("SaveLibraryPreview_Click", (string?)saveButton.Attribute("Click"), "preview save action");
+        var copyButton = NamedElement("CopyLibraryPreviewButton");
+        Equal("Copy", (string?)copyButton.Attribute("Content"), "preview copy button label");
+        Equal("CopyLibraryPreview_Click", (string?)copyButton.Attribute("Click"), "preview copy action");
+        Same(previewActionPanel, copyButton.Parent, "preview copy button is not next to save");
+        _ = NamedElement("LibraryPreviewVideo");
+
+        var timeFilterPanel = NamedElement("LibraryTimeFilterPanel");
+        Equal(presentation + "WrapPanel", timeFilterPanel.Name, "library time filter layout");
+        var overflowMenu = NamedElement("OverflowMenu");
+        Equal(
+            "Segoe UI Variable Text, Segoe UI",
+            (string?)overflowMenu.Attribute("FontFamily"),
+            "overflow menu inherited the icon font");
+        var thumbnail = document
+            .Descendants(presentation + "Border")
+            .Single(element => string.Equals(
+                (string?)element.Attribute("ContextMenuOpening"),
+                "LibraryThumbnail_ContextMenuOpening",
+                StringComparison.Ordinal));
+        var copyImageItem = thumbnail
+            .Descendants(presentation + "MenuItem")
+            .Single();
+        Equal("Copy Full-Quality Image", (string?)copyImageItem.Attribute("Header"), "thumbnail copy label");
+        Equal("CopyFullQualityImage_Click", (string?)copyImageItem.Attribute("Click"), "thumbnail copy action");
+        var openLibraryFolderButton = NamedElement("OpenLibraryFolderButton");
+        Equal("Open Photos Folder", (string?)openLibraryFolderButton.Attribute("Content"), "library folder button label");
+        Equal("OpenMasterFolder_Click", (string?)openLibraryFolderButton.Attribute("Click"), "library folder button action");
+        foreach (var (name, tag) in new[]
+                 {
+                     ("AllDatesFilterButton", "All"),
+                     ("TodayFilterButton", "Today"),
+                     ("ThisWeekFilterButton", "ThisWeek"),
+                     ("ThisMonthFilterButton", "ThisMonth"),
+                     ("ThisYearFilterButton", "ThisYear"),
+                     ("EarlierFilterButton", "Earlier"),
+                 })
+        {
+            var button = NamedElement(name);
+            Equal(presentation + "RadioButton", button.Name, $"{name} control type");
+            Equal(tag, (string?)button.Attribute("Tag"), $"{name} time filter tag");
+            Equal("LibraryTimeFilter_Click", (string?)button.Attribute("Click"), $"{name} filter action");
+            Same(timeFilterPanel, button.Parent, $"{name} wrapping container");
+        }
+        return Task.CompletedTask;
+    }
+
+    private static Task TestLibraryDateSortAndFilterAsync()
+    {
+        var now = new DateTimeOffset(new DateTime(2026, 9, 2, 12, 0, 0, DateTimeKind.Local));
+        var today = now.AddHours(-2);
+        var thisWeek = now.AddDays(-1);
+        var thisYear = new DateTimeOffset(new DateTime(2026, 2, 10, 12, 0, 0, DateTimeKind.Local));
+        var earlier = new DateTimeOffset(new DateTime(2025, 12, 31, 12, 0, 0, DateTimeKind.Local));
+
+        True(MainWindow.LibraryTimeFilterIncludes(today, LibraryTimeFilter.Today, now), "today filter");
+        False(MainWindow.LibraryTimeFilterIncludes(thisWeek, LibraryTimeFilter.Today, now), "today included yesterday");
+        True(MainWindow.LibraryTimeFilterIncludes(thisWeek, LibraryTimeFilter.ThisWeek, now), "week filter");
+        True(MainWindow.LibraryTimeFilterIncludes(today, LibraryTimeFilter.ThisMonth, now), "month filter");
+        True(MainWindow.LibraryTimeFilterIncludes(thisYear, LibraryTimeFilter.ThisYear, now), "year filter");
+        False(MainWindow.LibraryTimeFilterIncludes(earlier, LibraryTimeFilter.ThisYear, now), "year included older photo");
+        True(MainWindow.LibraryTimeFilterIncludes(earlier, LibraryTimeFilter.Earlier, now), "earlier filter");
+        True(MainWindow.LibraryTimeFilterIncludes(null, LibraryTimeFilter.All, now), "all dates omitted undated photo");
+        False(MainWindow.LibraryTimeFilterIncludes(null, LibraryTimeFilter.Earlier, now), "earlier included undated photo");
+
+        var sorted = MainWindow.SortLibraryItems(
+        [
+            Item("earlier", earlier),
+            Item("undated", null),
+            Item("today", today),
+            Item("this-week", thisWeek),
+        ]);
+        Equal("today,this-week,earlier,undated", string.Join(',', sorted.Select(item => item.Filename)),
+            "library was not sorted newest first with undated items last");
+        return Task.CompletedTask;
+
+        static LibraryAssetListItem Item(string filename, DateTimeOffset? captureDate)
+        {
+            var assetId = Guid.NewGuid();
+            var catalog = new CatalogAsset(
+                2,
+                assetId,
+                assetId.ToString("D"),
+                "revision",
+                "photo",
+                Array.Empty<string>(),
+                captureDate,
+                captureDate,
+                null,
+                false,
+                null,
+                null,
+                ArchiveState.Complete,
+                Array.Empty<CatalogFile>());
+            return new LibraryAssetListItem(
+                new PortableLibraryAsset(catalog, Array.Empty<PortableLibraryFile>()),
+                filename,
+                captureDate?.ToString("g") ?? "Date unavailable",
+                "Photo",
+                null,
+                captureDate);
+        }
+    }
+
+    private static async Task TestThumbnailCopySelectionAsync()
+    {
+        using var temporaryDirectory = new TemporaryDirectory();
+        var libraryRoot = Path.Combine(temporaryDirectory.Path, "Library");
+        Directory.CreateDirectory(libraryRoot);
+
+        var current = await File(
+            "Master/current.heic",
+            RepresentationRole.MasterCurrent,
+            StorageArea.Master,
+            "current.heic");
+        var original = await File(
+            "MB Photos Data/Resources/original.heic",
+            RepresentationRole.RootOriginal,
+            StorageArea.LibraryData,
+            "original.heic");
+        var motion = await File(
+            "MB Photos Data/Resources/motion.mov",
+            RepresentationRole.CurrentLiveMotion,
+            StorageArea.LibraryData,
+            "motion.mov");
+        var photo = Asset("photo", current, original);
+        Same(current, MainWindow.FindCopyableImageFile(photo), "thumbnail copy did not prefer the current full-quality image");
+        True(MainWindow.IsCopyableStillImage(current), "current photo was not copyable");
+
+        var livePhoto = new PortableLibraryAsset(
+            photo.Catalog with
+            {
+                MediaSubtypes = new[] { "livePhoto" },
+                LivePhotoRelationships = new LivePhotoRelationships(
+                    current.FileId,
+                    motion.FileId,
+                    original.FileId,
+                    null),
+            },
+            photo.Files.Append(motion).ToArray());
+        Same(current, MainWindow.FindCopyableImageFile(livePhoto), "Live Photo still image was not copyable");
+        False(MainWindow.IsCopyableStillImage(motion), "Live Photo motion was exposed as an image copy");
+
+        var originalOnlyPhoto = Asset("photo", original);
+        Same(original, MainWindow.FindCopyableImageFile(originalOnlyPhoto), "thumbnail copy did not fall back to the original image");
+        Equal<PortableLibraryFile?>(null, MainWindow.FindCopyableImageFile(Asset("video", current)), "video exposed image copy");
+
+        var compatibleSource = Path.Combine(temporaryDirectory.Path, "compatible-source.jpg");
+        WriteJpeg(compatibleSource, width: 3, height: 2);
+        var clipboardImage = MainWindow.CreatePlatformClipboardImage(compatibleSource);
+        NotNull(clipboardImage, "compatible clipboard image was not created");
+        Equal(3, clipboardImage!.Bitmap.PixelWidth, "clipboard image lost horizontal resolution");
+        Equal(2, clipboardImage.Bitmap.PixelHeight, "clipboard image lost vertical resolution");
+        True(
+            clipboardImage.PngBytes.Take(8).SequenceEqual(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }),
+            "clipboard image was not encoded as PNG");
+
+        return;
+
+        PortableLibraryAsset Asset(string mediaType, params PortableLibraryFile[] files)
+        {
+            var assetId = files[0].AssetId;
+            var catalog = new CatalogAsset(
+                2,
+                assetId,
+                assetId.ToString("D"),
+                "revision",
+                mediaType,
+                Array.Empty<string>(),
+                null,
+                null,
+                null,
+                false,
+                files.FirstOrDefault(file => file.Catalog.Roles.Contains(RepresentationRole.MasterCurrent))?.FileId,
+                null,
+                ArchiveState.Complete,
+                files.Select(file => file.Catalog).ToArray());
+            return new PortableLibraryAsset(catalog, files);
+        }
+
+        async Task<PortableLibraryFile> File(
+            string relativePath,
+            RepresentationRole role,
+            StorageArea storageArea,
+            string filename)
+        {
+            var assetId = Guid.Parse("4C671CB5-32FD-4971-AC82-A7C70955C3A0");
+            var path = Path.Combine(libraryRoot, relativePath.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var bytes = System.Text.Encoding.UTF8.GetBytes(relativePath);
+            await System.IO.File.WriteAllBytesAsync(path, bytes);
+            var isMotion = role is RepresentationRole.CurrentLiveMotion or RepresentationRole.OriginalLiveMotion;
+            var catalog = new CatalogFile(
+                Guid.NewGuid(),
+                "revision",
+                storageArea,
+                new[] { role },
+                role == RepresentationRole.MasterCurrent ? Criticality.MasterRequired : Criticality.ArchiveRequired,
+                Provenance.ExactPhotoKitResource,
+                isMotion ? "pairedVideo" : "photo",
+                1,
+                filename,
+                isMotion ? "com.apple.quicktime-movie" : "public.heic",
+                isMotion ? "video/quicktime" : "image/heic",
+                isMotion ? null : 100,
+                isMotion ? null : 100,
+                isMotion ? 1_000 : null,
+                bytes.Length,
+                await Hashing.Sha256FileAsync(path),
+                null,
+                relativePath,
+                Availability.Available);
+            return new PortableLibraryFile(assetId, catalog, libraryRoot);
+        }
+    }
+
+    private static async Task TestLibrarySaveAsAsync()
+    {
+        Equal(
+            "IMG_0042.heic",
+            MainWindow.SuggestedLibraryExportFilename("IMG_0042.HEIC", "FullSizeRender.heic", Guid.NewGuid()),
+            "edited photo save name");
+        Equal(
+            "IMG_0042.MOV",
+            MainWindow.SuggestedLibraryExportFilename("IMG_0042.HEIC", "pairedVideo.MOV", Guid.NewGuid()),
+            "Live Photo video save name");
+
+        using var temporaryDirectory = new TemporaryDirectory();
+        var libraryRoot = Path.Combine(temporaryDirectory.Path, "Library");
+        var sourceRelativePath = "MB Photos Data/media/source.heic";
+        var sourcePath = Path.Combine(libraryRoot, sourceRelativePath.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(sourcePath)!);
+        var bytes = new byte[] { 1, 3, 3, 7, 9, 2, 4, 8 };
+        await File.WriteAllBytesAsync(sourcePath, bytes);
+        var assetId = Guid.NewGuid();
+        var fileId = Guid.NewGuid();
+        var catalog = new CatalogFile(
+            fileId,
+            "revision",
+            StorageArea.Master,
+            new[] { RepresentationRole.MasterCurrent },
+            Criticality.MasterRequired,
+            Provenance.ExactPhotoKitResource,
+            "fullSizePhoto",
+            null,
+            "FullSizeRender.heic",
+            "public.heic",
+            "image/heic",
+            100,
+            100,
+            null,
+            bytes.Length,
+            await Hashing.Sha256FileAsync(sourcePath),
+            null,
+            sourceRelativePath,
+            Availability.Available);
+        var file = new PortableLibraryFile(assetId, catalog, libraryRoot);
+        var destinationDirectory = Path.Combine(temporaryDirectory.Path, "Saved");
+        Directory.CreateDirectory(destinationDirectory);
+        var chosenPath = Path.Combine(destinationDirectory, "Vacation portrait.heic");
+        var exporter = new VariantExportService();
+
+        var first = await exporter.ExportToPathAsync(file, chosenPath);
+        Equal(Path.GetFullPath(chosenPath), first.ExportedPath, "chosen export filename");
+        var firstContents = await File.ReadAllBytesAsync(chosenPath);
+        True(bytes.SequenceEqual(firstContents), "chosen export contents");
+
+        await File.WriteAllTextAsync(chosenPath, "replace me");
+        var replacement = await exporter.ExportToPathAsync(file, chosenPath);
+        False(replacement.ExistingVerified, "different chosen file was not replaced");
+        var replacementContents = await File.ReadAllBytesAsync(chosenPath);
+        True(bytes.SequenceEqual(replacementContents), "replacement export contents");
+    }
+
+    private static Task TestDuplicateLibraryVersionsCollapseAsync()
+    {
+        var uneditedMedia = Guid.NewGuid();
+        var liveMotion = Guid.NewGuid();
+        var choices = MainWindow.DistinctVariantKinds(
+        [
+            (VariantKind.CurrentMaster, uneditedMedia),
+            (VariantKind.RootOriginal, uneditedMedia),
+            (VariantKind.CurrentLiveMotion, liveMotion),
+            (VariantKind.OriginalLiveMotion, liveMotion),
+        ]);
+
+        Equal(
+            "CurrentMaster,CurrentLiveMotion",
+            string.Join(',', choices),
+            "duplicate file roles were exposed as separate choices");
+        False(MainWindow.ShouldShowVariantSelection(0, 0), "empty version selector is visible");
+        False(MainWindow.ShouldShowVariantSelection(1, 0), "single version selector is visible");
+        True(MainWindow.ShouldShowVariantSelection(2, 0), "distinct version selector is hidden");
+        True(MainWindow.ShouldShowVariantSelection(1, 1), "additional original selector is hidden");
         return Task.CompletedTask;
     }
 
@@ -283,18 +716,21 @@ internal static class Program
     private static ReceiverSettingsStore StoreIn(string root) => new(
         Path.Combine(root, "Settings", "settings.json"));
 
-    private static void WriteJpeg(string path)
+    private static void WriteJpeg(string path, int width = 1, int height = 1)
     {
-        var pixels = new byte[] { 0x20, 0x80, 0xE0, 0xFF };
+        var pixels = Enumerable
+            .Repeat(new byte[] { 0x20, 0x80, 0xE0, 0xFF }, width * height)
+            .SelectMany(pixel => pixel)
+            .ToArray();
         var bitmap = BitmapSource.Create(
-            1,
-            1,
+            width,
+            height,
             96,
             96,
             PixelFormats.Bgra32,
             null,
             pixels,
-            stride: 4);
+            stride: width * 4);
         var encoder = new JpegBitmapEncoder();
         encoder.Frames.Add(BitmapFrame.Create(bitmap));
         using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);

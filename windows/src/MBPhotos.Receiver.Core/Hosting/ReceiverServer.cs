@@ -36,6 +36,7 @@ public sealed class ReceiverServer : IAsyncDisposable
     private readonly Ledger ledger;
     private readonly DestinationLease destinationLease;
     private readonly ActiveJobTracker activeJobs;
+    private readonly bool ownsDiagnostics;
 
     private ReceiverServer(
         WebApplication application,
@@ -47,6 +48,7 @@ public sealed class ReceiverServer : IAsyncDisposable
         DestinationContext destination,
         JobCoordinator coordinator,
         RedactingFileLoggerProvider diagnostics,
+        bool ownsDiagnostics,
         IPAddress address,
         int port)
     {
@@ -59,6 +61,7 @@ public sealed class ReceiverServer : IAsyncDisposable
         Destination = destination;
         Coordinator = coordinator;
         Diagnostics = diagnostics;
+        this.ownsDiagnostics = ownsDiagnostics;
         Address = address;
         Port = port;
         pairing.StateChanged += Pairing_StateChanged;
@@ -120,9 +123,16 @@ public sealed class ReceiverServer : IAsyncDisposable
         bool allowInitialize,
         IPAddress? listenAddress = null,
         string? diagnosticDirectory = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        RedactingFileLoggerProvider? diagnosticProvider = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (diagnosticDirectory is not null && diagnosticProvider is not null)
+        {
+            throw new ArgumentException(
+                "Choose either a diagnostic directory or a shared diagnostic provider, not both.",
+                nameof(diagnosticProvider));
+        }
         var address = listenAddress ?? NetworkAddressSelector.SelectPreferred();
         if (address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
         {
@@ -202,7 +212,8 @@ public sealed class ReceiverServer : IAsyncDisposable
             destinationLease.Dispose();
             throw;
         }
-        var diagnostics = new RedactingFileLoggerProvider(diagnosticDirectory);
+        var ownsDiagnostics = diagnosticProvider is null;
+        var diagnostics = diagnosticProvider ?? new RedactingFileLoggerProvider(diagnosticDirectory);
 
         var builder = WebApplication.CreateBuilder(new WebApplicationOptions
         {
@@ -210,7 +221,9 @@ public sealed class ReceiverServer : IAsyncDisposable
             Args = Array.Empty<string>(),
         });
         builder.Logging.ClearProviders();
-        builder.Logging.AddProvider(diagnostics);
+        builder.Logging.AddProvider(ownsDiagnostics
+            ? diagnostics
+            : new NonDisposingLoggerProvider(diagnostics));
         builder.WebHost.ConfigureKestrel(options =>
         {
             options.AddServerHeader = false;
@@ -241,6 +254,7 @@ public sealed class ReceiverServer : IAsyncDisposable
             run.ReceiverRunId,
             jsonOptions,
             activeJobs,
+            diagnostics,
             terminal => startedServer?.HandleTerminalResponseCompleted(terminal));
         try
         {
@@ -261,6 +275,7 @@ public sealed class ReceiverServer : IAsyncDisposable
                 destination,
                 coordinator,
                 diagnostics,
+                ownsDiagnostics,
                 address,
                 bound.Port);
             return startedServer;
@@ -272,7 +287,10 @@ public sealed class ReceiverServer : IAsyncDisposable
             await ledger.DisposeAsync();
             destinationLease.Dispose();
             pairing.EndRun();
-            diagnostics.Dispose();
+            if (ownsDiagnostics)
+            {
+                diagnostics.Dispose();
+            }
             throw;
         }
     }
@@ -321,7 +339,11 @@ public sealed class ReceiverServer : IAsyncDisposable
         Attempt(certificate.Dispose);
         await AttemptAsync(() => ledger.DisposeAsync().AsTask(), "ledger disposal");
         Attempt(destinationLease.Dispose);
-        await AttemptAsync(() => Diagnostics.DisposeAsync().AsTask(), "diagnostics flush");
+        await AttemptAsync(
+            () => ownsDiagnostics
+                ? Diagnostics.DisposeAsync().AsTask()
+                : Diagnostics.FlushAsync(),
+            "diagnostics flush");
 
         if (failures.Count == 1)
         {
@@ -342,8 +364,56 @@ public sealed class ReceiverServer : IAsyncDisposable
         string receiverRunId,
         JsonSerializerOptions jsonOptions,
         ActiveJobTracker activeJobs,
+        RedactingFileLoggerProvider diagnostics,
         Action<ReceiverTerminalResponseCompletedEventArgs> terminalResponseCompleted)
     {
+        async Task FlushDiagnosticsBestEffortAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await diagnostics.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Diagnostics must never change receiver protocol behavior.
+            }
+        }
+
+        app.Use(async (context, next) =>
+        {
+            var path = context.Request.Path.Value ?? string.Empty;
+            var durableBoundary = string.Equals(path, "/v2/pair", StringComparison.Ordinal) ||
+                string.Equals(path, "/v2/jobs", StringComparison.Ordinal);
+            var startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            app.Logger.LogInformation(
+                "Receiver request started method={Method} path={Path} contentLength={ContentLength}",
+                context.Request.Method,
+                path,
+                context.Request.ContentLength);
+            if (durableBoundary)
+            {
+                await FlushDiagnosticsBestEffortAsync(context.RequestAborted).ConfigureAwait(false);
+            }
+
+            try
+            {
+                await next(context).ConfigureAwait(false);
+            }
+            finally
+            {
+                app.Logger.LogInformation(
+                    "Receiver request finished method={Method} path={Path} status={StatusCode} elapsedMs={ElapsedMilliseconds:F1}",
+                    context.Request.Method,
+                    path,
+                    context.Response.StatusCode,
+                    System.Diagnostics.Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds);
+                if (durableBoundary)
+                {
+                    await FlushDiagnosticsBestEffortAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+        });
+
         app.Use(async (context, next) =>
         {
             Guid? requestId = null;
@@ -494,6 +564,13 @@ public sealed class ReceiverServer : IAsyncDisposable
             try
             {
                 job = await ReadRequiredAsync<ExportJob>(context, jsonOptions);
+                app.Logger.LogInformation(
+                    "Job manifest received jobId={JobId} assets={AssetCount} files={FileCount} selection={SelectionKind}",
+                    job.JobId,
+                    job.Assets.Count,
+                    job.Assets.Sum(static asset => asset.Files.Count),
+                    job.Selection.Kind);
+                await FlushDiagnosticsBestEffortAsync(CancellationToken.None).ConfigureAwait(false);
             }
             catch
             {
@@ -539,6 +616,15 @@ public sealed class ReceiverServer : IAsyncDisposable
             try
             {
                 var plan = await coordinator.CreateJobAsync(job, context.RequestAborted);
+                app.Logger.LogInformation(
+                    "Job plan created jobId={JobId} state={State} upload={UploadCount} resume={ResumeCount} skip={SkipCount} conflict={ConflictCount}",
+                    job.JobId,
+                    plan.State,
+                    plan.Decisions.Count(static decision => decision.Action == JobFileAction.Upload),
+                    plan.Decisions.Count(static decision => decision.Action == JobFileAction.Resume),
+                    plan.Decisions.Count(static decision => decision.Action == JobFileAction.Skip),
+                    plan.Decisions.Count(static decision => decision.Action == JobFileAction.Conflict));
+                await FlushDiagnosticsBestEffortAsync(CancellationToken.None).ConfigureAwait(false);
                 if (plan.State is JobState.Completed or JobState.CompletedWithFailures or JobState.Abandoned)
                 {
                     var terminalActivity = coordinator.GetTerminalActivity(job.JobId);

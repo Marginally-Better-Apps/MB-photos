@@ -6,12 +6,12 @@ using System.Windows.Controls;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using MBPhotos.Receiver.Diagnostics;
 using MBPhotos.Receiver.Library;
 using MBPhotos.Receiver.Models;
 using MBPhotos.Receiver.Transfer;
 using Microsoft.Win32;
 using Button = System.Windows.Controls.Button;
+using RadioButton = System.Windows.Controls.RadioButton;
 
 namespace MBPhotos.Receiver.Wpf;
 
@@ -25,13 +25,22 @@ public partial class MainWindow : Window
     private readonly VariantExportService variantExportService = new();
 
     private PortableLibrarySnapshot? openLibrary;
+    private IReadOnlyList<LibraryAssetListItem> libraryItems = Array.Empty<LibraryAssetListItem>();
     private CancellationTokenSource? previewLoadCancellation;
+    private CancellationTokenSource? libraryPreviewLoadCancellation;
+    private PortableLibraryFile? selectedLibraryPreviewFile;
+    private string selectedLibraryPreviewLabel = string.Empty;
     private string? previewRequestIdentity;
     private string? openedLibraryPath;
     private string? alternateLibraryPath;
     private long libraryLoadRevision;
+    private long libraryPreviewRevision;
     private long appliedSnapshotRevision = -1;
     private bool isLibraryExportInProgress;
+    private bool isClipboardCopyInProgress;
+    private bool isConfiguringLibraryVersions;
+    private bool isLibraryVideoPreviewActive;
+    private LibraryTimeFilter libraryTimeFilter = LibraryTimeFilter.All;
 
     public MainWindow()
     {
@@ -49,6 +58,7 @@ public partial class MainWindow : Window
         AppVersionText.Text = ProductVersionText();
 
         Closing += Window_Closing;
+        IsVisibleChanged += Window_IsVisibleChanged;
         orchestrator.StateChanged += Orchestrator_StateChanged;
         ApplySnapshot(orchestrator.Snapshot);
     }
@@ -368,16 +378,23 @@ public partial class MainWindow : Window
 
     private async Task OpenLibraryAsync(string rootPath, bool force = false)
     {
-        if (!force && string.Equals(openedLibraryPath, rootPath, StringComparison.OrdinalIgnoreCase))
+        var isDifferentLibrary = !string.Equals(openedLibraryPath, rootPath, StringComparison.OrdinalIgnoreCase);
+        if (!force && !isDifferentLibrary)
         {
             return;
         }
 
         var revision = Interlocked.Increment(ref libraryLoadRevision);
+        if (isDifferentLibrary)
+        {
+            libraryTimeFilter = LibraryTimeFilter.All;
+        }
         openedLibraryPath = rootPath;
         openLibrary = null;
+        libraryItems = Array.Empty<LibraryAssetListItem>();
         LibrarySummaryText.Text = "Opening your photos…";
         LibraryAssetList.ItemsSource = null;
+        ConfigureLibraryTimeFilters(DateTimeOffset.Now);
         ClearLibrarySelection("Choose a photo or video to see its available versions.");
         try
         {
@@ -386,7 +403,7 @@ public partial class MainWindow : Window
                 var loaded = await portableLibraryService.OpenAsync(rootPath).ConfigureAwait(false);
                 return (
                     loaded,
-                    loaded.Assets.Select(CreateLibraryListItem).ToArray());
+                    SortLibraryItems(loaded.Assets.Select(CreateLibraryListItem)));
             });
 
             if (revision != Volatile.Read(ref libraryLoadRevision) ||
@@ -396,19 +413,10 @@ public partial class MainWindow : Window
             }
 
             openLibrary = snapshot;
-            LibrarySummaryText.Text = items.Length == 0
-                ? "No transferred photos yet"
-                : $"{items.Length:N0} {ItemWord(items.Length)} • Updated {snapshot.Catalog.GeneratedAt.LocalDateTime:g}";
-            LibraryAssetList.ItemsSource = items;
+            libraryItems = items;
             LibraryExportStatusText.Text = string.Empty;
-            if (items.Length > 0)
-            {
-                LibraryAssetList.SelectedIndex = 0;
-            }
-            else
-            {
-                ClearLibrarySelection("This library does not contain any photos yet.");
-            }
+            ConfigureLibraryTimeFilters(DateTimeOffset.Now);
+            ApplyLibraryTimeFilter(DateTimeOffset.Now);
         }
         catch (FileNotFoundException)
         {
@@ -456,6 +464,20 @@ public partial class MainWindow : Window
         }
     }
 
+    private void LibraryTimeFilter_Click(object sender, RoutedEventArgs e)
+    {
+        if (isLibraryExportInProgress ||
+            sender is not RadioButton button ||
+            button.Tag is not string tag ||
+            !Enum.TryParse<LibraryTimeFilter>(tag, out var filter))
+        {
+            return;
+        }
+
+        libraryTimeFilter = filter;
+        ApplyLibraryTimeFilter(DateTimeOffset.Now);
+    }
+
     private void LibraryAssetList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (isLibraryExportInProgress)
@@ -469,7 +491,6 @@ public partial class MainWindow : Window
         }
 
         var asset = item.Asset;
-        LibraryPreviewImage.Source = LoadPreview(item.ThumbnailPath);
         LibraryFilenameText.Text = item.Filename;
         LibraryDateText.Text = item.DateText;
         var flags = new List<string> { asset.Catalog.MediaType == "video" ? "Video" : "Photo" };
@@ -483,19 +504,146 @@ public partial class MainWindow : Window
         }
         LibraryFlagsText.Text = string.Join(" • ", flags);
 
-        var individualOriginals = BuildOriginalChoices(asset);
-        IndividualOriginalsComboBox.ItemsSource = individualOriginals;
-        IndividualOriginalsComboBox.SelectedIndex = individualOriginals.Count == 0 ? -1 : 0;
-        ConfigureExportButtons(asset);
+        var additionalOriginals = BuildAdditionalOriginalChoices(asset);
+        isConfiguringLibraryVersions = true;
+        IndividualOriginalsComboBox.ItemsSource = additionalOriginals;
+        IndividualOriginalsComboBox.SelectedIndex = -1;
+        AdditionalOriginalsPanel.Visibility = additionalOriginals.Count > 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        isConfiguringLibraryVersions = false;
+        ConfigureVariantButtons(asset);
+        SelectPreferredLibraryPreview(asset, item.ThumbnailPath);
         LibraryExportStatusText.Text = string.Empty;
     }
 
-    private async void ExportVariant_Click(object sender, RoutedEventArgs e)
+    private void LibraryThumbnail_ContextMenuOpening(object sender, ContextMenuEventArgs e)
     {
         if (isLibraryExportInProgress ||
-            openLibrary is null ||
+            isClipboardCopyInProgress ||
+            sender is not FrameworkElement { DataContext: LibraryAssetListItem item } ||
+            FindCopyableImageFile(item.Asset) is null)
+        {
+            e.Handled = true;
+            return;
+        }
+
+        LibraryAssetList.SelectedItem = item;
+    }
+
+    private async void CopyFullQualityImage_Click(object sender, RoutedEventArgs e)
+    {
+        if (isLibraryExportInProgress ||
             LibraryAssetList.SelectedItem is not LibraryAssetListItem item ||
-            sender is not Button button ||
+            FindCopyableImageFile(item.Asset) is not { } file)
+        {
+            return;
+        }
+
+        await CopyImageFileToClipboardAsync(file);
+    }
+
+    private async void CopyLibraryPreview_Click(object sender, RoutedEventArgs e)
+    {
+        if (!isLibraryExportInProgress &&
+            selectedLibraryPreviewFile is { } file &&
+            IsCopyableStillImage(file))
+        {
+            await CopyImageFileToClipboardAsync(file);
+        }
+    }
+
+    private async Task CopyImageFileToClipboardAsync(PortableLibraryFile file)
+    {
+        if (isClipboardCopyInProgress ||
+            !IsCopyableStillImage(file) ||
+            file.AbsolutePath is not { } path ||
+            !File.Exists(path))
+        {
+            return;
+        }
+
+        isClipboardCopyInProgress = true;
+        CopyLibraryPreviewButton.IsEnabled = false;
+        SetResourceBrush(LibraryExportStatusText, "TextSecondaryBrush");
+        LibraryExportStatusText.Text = "Preparing a full-resolution image…";
+        try
+        {
+            var image = await Task.Run(() => CreatePlatformClipboardImage(path));
+            if (image is null)
+            {
+                SetResourceBrush(LibraryExportStatusText, "ErrorBrush");
+                LibraryExportStatusText.Text = "This image could not be prepared for the clipboard. Use Save to keep the original file.";
+                return;
+            }
+
+            var clipboardData = new System.Windows.DataObject();
+            clipboardData.SetData(System.Windows.DataFormats.Bitmap, image.Bitmap);
+            clipboardData.SetData("PNG", new MemoryStream(image.PngBytes, writable: false));
+            System.Windows.Clipboard.SetDataObject(clipboardData, true);
+            SetResourceBrush(LibraryExportStatusText, "SuccessBrush");
+            LibraryExportStatusText.Text = "Full-resolution image copied in a widely supported format.";
+        }
+        catch (Exception exception) when (exception is System.Runtime.InteropServices.ExternalException)
+        {
+            System.Windows.MessageBox.Show(
+                this,
+                "The full-quality image could not be copied. Try again in a moment.",
+                "Clipboard unavailable",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+        finally
+        {
+            isClipboardCopyInProgress = false;
+            CopyLibraryPreviewButton.IsEnabled = !isLibraryExportInProgress;
+        }
+    }
+
+    internal static PlatformClipboardImage? CreatePlatformClipboardImage(string path)
+    {
+        try
+        {
+            using var input = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete,
+                128 * 1024,
+                FileOptions.SequentialScan);
+            var bitmap = new BitmapImage();
+            bitmap.BeginInit();
+            bitmap.CacheOption = BitmapCacheOption.OnLoad;
+            bitmap.CreateOptions = BitmapCreateOptions.PreservePixelFormat;
+            bitmap.StreamSource = input;
+            bitmap.EndInit();
+            bitmap.Freeze();
+
+            var encoder = new PngBitmapEncoder();
+            encoder.Frames.Add(BitmapFrame.Create(bitmap));
+            using var output = new MemoryStream();
+            encoder.Save(output);
+            return new PlatformClipboardImage(bitmap, output.ToArray());
+        }
+        catch (Exception exception) when (exception is
+            IOException or
+            UnauthorizedAccessException or
+            NotSupportedException or
+            InvalidOperationException or
+            OutOfMemoryException or
+            System.Runtime.InteropServices.ExternalException or
+            FormatException or
+            ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    private void PreviewVariant_Click(object sender, RoutedEventArgs e)
+    {
+        if (isLibraryExportInProgress ||
+            LibraryAssetList.SelectedItem is not LibraryAssetListItem item ||
+            sender is not RadioButton button ||
             button.Tag is not string tag ||
             !Enum.TryParse<VariantKind>(tag, out var variant))
         {
@@ -505,24 +653,35 @@ public partial class MainWindow : Window
         var file = FindExportableFile(item.Asset, variant);
         if (file is null)
         {
-            System.Windows.MessageBox.Show(
-                this,
-                "That version is not available for this item.",
-                "Version unavailable",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
+            button.IsEnabled = false;
             return;
         }
 
-        await ExportFileAsync(file, VariantLabel(variant));
+        isConfiguringLibraryVersions = true;
+        IndividualOriginalsComboBox.SelectedIndex = -1;
+        isConfiguringLibraryVersions = false;
+        SelectLibraryPreview(file, VariantLabel(variant), variant, item.ThumbnailPath);
     }
 
-    private async void ExportIndividualOriginal_Click(object sender, RoutedEventArgs e)
+    private void IndividualOriginalsComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (!isLibraryExportInProgress &&
-            IndividualOriginalsComboBox.SelectedItem is OriginalExportChoice choice)
+        if (isConfiguringLibraryVersions ||
+            isLibraryExportInProgress ||
+            LibraryAssetList.SelectedItem is not LibraryAssetListItem item ||
+            IndividualOriginalsComboBox.SelectedItem is not LibraryVariantChoice choice)
         {
-            await ExportFileAsync(choice.File, choice.Label);
+            return;
+        }
+
+        SetCheckedVariant(null);
+        SelectLibraryPreview(choice.File, choice.Label, null, item.ThumbnailPath);
+    }
+
+    private async void SaveLibraryPreview_Click(object sender, RoutedEventArgs e)
+    {
+        if (!isLibraryExportInProgress && selectedLibraryPreviewFile is { } file)
+        {
+            await ExportFileAsync(file, selectedLibraryPreviewLabel);
         }
     }
 
@@ -533,33 +692,72 @@ public partial class MainWindow : Window
             return;
         }
 
-        var dialog = new OpenFolderDialog
+        var suggestedFilename = SuggestedLibraryExportFilename(file);
+        var extension = Path.GetExtension(suggestedFilename);
+        var dialog = new Microsoft.Win32.SaveFileDialog
         {
-            Title = $"Save {label}",
-            Multiselect = false,
+            Title = $"Save {label} as",
+            FileName = suggestedFilename,
+            Filter = string.IsNullOrEmpty(extension)
+                ? "All files (*.*)|*.*"
+                : $"{extension.TrimStart('.').ToUpperInvariant()} files (*{extension})|*{extension}|All files (*.*)|*.*",
+            DefaultExt = extension,
+            AddExtension = !string.IsNullOrEmpty(extension),
+            OverwritePrompt = true,
+            CheckPathExists = true,
+            RestoreDirectory = true,
         };
         if (dialog.ShowDialog(this) != true)
         {
             return;
         }
 
+        var resumeVideoPreview = isLibraryVideoPreviewActive &&
+            selectedLibraryPreviewFile?.FileId == file.FileId &&
+            file.AbsolutePath is not null;
         isLibraryExportInProgress = true;
         SetLibraryInteractionEnabled(false);
         SetResourceBrush(LibraryExportStatusText, "TextSecondaryBrush");
         LibraryExportStatusText.Text = $"Saving {label}…";
         try
         {
-            var result = await variantExportService.ExportAsync(file, dialog.FolderName);
+            if (resumeVideoPreview)
+            {
+                // MediaElement can retain an open handle to the selected MOV.
+                // Close it before exact-copy verification and let WPF release
+                // the native media resources before opening the file again.
+                StopLibraryVideoPreview();
+                await System.Windows.Threading.Dispatcher.Yield(DispatcherPriority.Background);
+            }
+
+            var result = await variantExportService.ExportToPathAsync(file, dialog.FileName);
             SetResourceBrush(LibraryExportStatusText, "SuccessBrush");
-            var folderName = new DirectoryInfo(Path.GetDirectoryName(result.ExportedPath) ?? dialog.FolderName).Name;
+            var folderName = new DirectoryInfo(Path.GetDirectoryName(result.ExportedPath)!).Name;
             LibraryExportStatusText.Text = result.ExistingVerified
                 ? $"An identical copy is already in {folderName}."
                 : $"Saved to {folderName}.";
+
+            var successMessage = result.ExistingVerified
+                ? $"An identical copy already exists here:\n\n{result.ExportedPath}"
+                : $"Saved a copy here:\n\n{result.ExportedPath}";
+            System.Windows.MessageBox.Show(
+                this,
+                successMessage,
+                "Version saved",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            var failureMessage = LibraryExportFailureMessage(exception);
             SetResourceBrush(LibraryExportStatusText, "ErrorBrush");
-            LibraryExportStatusText.Text = "That version could not be saved. Check the destination folder and try again.";
+            LibraryExportStatusText.Text = failureMessage;
+            System.Windows.MessageBox.Show(
+                this,
+                failureMessage,
+                "Version could not be saved",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
         }
         finally
         {
@@ -567,9 +765,59 @@ public partial class MainWindow : Window
             SetLibraryInteractionEnabled(true);
             if (openLibrary == library && LibraryAssetList.SelectedItem is LibraryAssetListItem selected)
             {
-                ConfigureExportButtons(selected.Asset);
+                ConfigureVariantButtons(selected.Asset);
+            }
+            if (resumeVideoPreview &&
+                selectedLibraryPreviewFile?.FileId == file.FileId &&
+                file.AbsolutePath is { } videoPath)
+            {
+                StartLibraryVideoPreview(videoPath);
             }
         }
+    }
+
+    internal static string LibraryExportFailureMessage(Exception exception) => exception switch
+    {
+        InvalidDataException =>
+            "The selected library file has changed or is incomplete. Reload the library and try again.",
+        InvalidOperationException when exception.Message.Contains("outside", StringComparison.OrdinalIgnoreCase) ||
+                                       exception.Message.Contains("inside", StringComparison.OrdinalIgnoreCase) =>
+            "Choose a folder outside the MB Photos library, then try again.",
+        UnauthorizedAccessException =>
+            "Windows denied access to that folder. Choose another folder or check its permissions.",
+        IOException =>
+            "The file could not be copied. Close any app using the file, then try another folder.",
+        _ =>
+            "That version could not be saved. Choose another folder and try again.",
+    };
+
+    private string SuggestedLibraryExportFilename(PortableLibraryFile file)
+    {
+        var displayFilename = LibraryAssetList.SelectedItem is LibraryAssetListItem item &&
+                              item.Asset.AssetId == file.AssetId
+            ? item.Filename
+            : file.Catalog.OriginalFilename;
+        return SuggestedLibraryExportFilename(displayFilename, file.Catalog.OriginalFilename, file.FileId);
+    }
+
+    internal static string SuggestedLibraryExportFilename(
+        string displayFilename,
+        string representationFilename,
+        Guid fileId)
+    {
+        var displayLeaf = Path.GetFileName(displayFilename);
+        var representationLeaf = Path.GetFileName(representationFilename);
+        var stem = Path.GetFileNameWithoutExtension(displayLeaf);
+        if (string.IsNullOrWhiteSpace(stem))
+        {
+            stem = Path.GetFileNameWithoutExtension(representationLeaf);
+        }
+        if (string.IsNullOrWhiteSpace(stem))
+        {
+            stem = fileId.ToString("D");
+        }
+
+        return stem + Path.GetExtension(representationLeaf);
     }
 
     private async void OpenMasterFolder_Click(object sender, RoutedEventArgs e)
@@ -601,8 +849,6 @@ public partial class MainWindow : Window
 
     private async void ExportDiagnostics_Click(object sender, RoutedEventArgs e)
     {
-        var receiver = orchestrator.Snapshot.Receiver;
-
         var dialog = new Microsoft.Win32.SaveFileDialog
         {
             Title = "Export redacted diagnostics",
@@ -616,14 +862,7 @@ public partial class MainWindow : Window
 
         try
         {
-            if (receiver is not null)
-            {
-                await receiver.Diagnostics.ExportAsync(dialog.FileName);
-            }
-            else
-            {
-                await RedactingFileLoggerProvider.ExportExistingAsync(dialog.FileName);
-            }
+            await app.Diagnostics.ExportAsync(dialog.FileName);
         }
         catch (Exception)
         {
@@ -641,6 +880,8 @@ public partial class MainWindow : Window
         if (app.IsExiting)
         {
             orchestrator.StateChanged -= Orchestrator_StateChanged;
+            CancelLibraryImagePreview();
+            StopLibraryVideoPreview();
             previewLoadCancellation?.Cancel();
             previewLoadCancellation?.Dispose();
             previewLoadCancellation = null;
@@ -650,10 +891,28 @@ public partial class MainWindow : Window
         app.HandleWindowClosing(e);
     }
 
+    private void Window_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (!isLibraryVideoPreviewActive)
+        {
+            return;
+        }
+
+        if (IsVisible)
+        {
+            LibraryPreviewVideo.Play();
+        }
+        else
+        {
+            LibraryPreviewVideo.Pause();
+        }
+    }
+
     private static LibraryAssetListItem CreateLibraryListItem(PortableLibraryAsset asset)
     {
-        var preferredFile = asset.MasterFile ??
-            asset.Files.FirstOrDefault(file => file.Catalog.Roles.Contains(RepresentationRole.RootOriginal)) ??
+        var preferredFile = asset.Files.FirstOrDefault(file =>
+                file.Catalog.Roles.Contains(RepresentationRole.RootOriginal)) ??
+            asset.MasterFile ??
             asset.Files.FirstOrDefault();
         var filename = preferredFile?.Catalog.OriginalFilename ?? asset.AssetId.ToString("D");
         var dateText = asset.Catalog.CreationDate?.LocalDateTime.ToString("g") ?? "Date unavailable";
@@ -681,8 +940,144 @@ public partial class MainWindow : Window
             filename,
             dateText,
             string.Join(" • ", statuses),
-            thumbnailPath);
+            thumbnailPath,
+            asset.Catalog.CreationDate);
     }
+
+    internal static LibraryAssetListItem[] SortLibraryItems(IEnumerable<LibraryAssetListItem> items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        return items
+            .OrderByDescending(item => item.CaptureDate?.UtcDateTime.Ticks ?? long.MinValue)
+            .ThenBy(item => item.Filename, StringComparer.CurrentCultureIgnoreCase)
+            .ThenBy(item => item.Asset.AssetId)
+            .ToArray();
+    }
+
+    internal static bool LibraryTimeFilterIncludes(
+        DateTimeOffset? captureDate,
+        LibraryTimeFilter filter,
+        DateTimeOffset now)
+    {
+        if (filter == LibraryTimeFilter.All)
+        {
+            return true;
+        }
+        if (captureDate is null)
+        {
+            return false;
+        }
+
+        var captured = captureDate.Value.ToLocalTime().DateTime;
+        var today = now.ToLocalTime().Date;
+        var startOfWeek = today.AddDays(-(((int)today.DayOfWeek + 6) % 7));
+        return filter switch
+        {
+            LibraryTimeFilter.Today => captured.Date == today,
+            LibraryTimeFilter.ThisWeek => captured >= startOfWeek && captured < startOfWeek.AddDays(7),
+            LibraryTimeFilter.ThisMonth => captured.Year == today.Year && captured.Month == today.Month,
+            LibraryTimeFilter.ThisYear => captured.Year == today.Year,
+            LibraryTimeFilter.Earlier => captured < new DateTime(today.Year, 1, 1),
+            _ => throw new ArgumentOutOfRangeException(nameof(filter)),
+        };
+    }
+
+    private void ConfigureLibraryTimeFilters(DateTimeOffset now)
+    {
+        var filters = LibraryTimeFilterButtons();
+        foreach (var (filter, button) in filters)
+        {
+            button.Visibility = filter == LibraryTimeFilter.All ||
+                                libraryItems.Any(item =>
+                                    LibraryTimeFilterIncludes(item.CaptureDate, filter, now))
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        if (libraryTimeFilter != LibraryTimeFilter.All &&
+            filters.First(pair => pair.Filter == libraryTimeFilter).Button.Visibility != Visibility.Visible)
+        {
+            libraryTimeFilter = LibraryTimeFilter.All;
+        }
+
+        foreach (var (filter, button) in filters)
+        {
+            button.IsChecked = filter == libraryTimeFilter;
+        }
+        LibraryTimeFilterPanel.Visibility = filters.Count(pair => pair.Button.Visibility == Visibility.Visible) > 1
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+    }
+
+    private void ApplyLibraryTimeFilter(DateTimeOffset now)
+    {
+        var visibleItems = libraryItems
+            .Where(item => LibraryTimeFilterIncludes(item.CaptureDate, libraryTimeFilter, now))
+            .ToArray();
+        LibraryAssetList.ItemsSource = visibleItems;
+        UpdateLibrarySummary(visibleItems.Length);
+
+        if (visibleItems.Length > 0)
+        {
+            LibraryAssetList.SelectedIndex = 0;
+        }
+        else
+        {
+            ClearLibrarySelection(libraryItems.Count == 0
+                ? "This library does not contain any photos yet."
+                : LibraryTimeFilterEmptyMessage(libraryTimeFilter));
+        }
+    }
+
+    private void UpdateLibrarySummary(int visibleCount)
+    {
+        if (openLibrary is not { } library)
+        {
+            return;
+        }
+        if (libraryItems.Count == 0)
+        {
+            LibrarySummaryText.Text = "No transferred photos yet";
+            return;
+        }
+
+        var updated = library.Catalog.GeneratedAt.LocalDateTime.ToString("g");
+        LibrarySummaryText.Text = libraryTimeFilter == LibraryTimeFilter.All
+            ? $"{libraryItems.Count:N0} {ItemWord(libraryItems.Count)} • Newest first • Updated {updated}"
+            : $"{visibleCount:N0} of {libraryItems.Count:N0} {ItemWord(libraryItems.Count)} • " +
+              $"{LibraryTimeFilterLabel(libraryTimeFilter)} • Newest first • Updated {updated}";
+    }
+
+    private (LibraryTimeFilter Filter, RadioButton Button)[] LibraryTimeFilterButtons() =>
+    [
+        (LibraryTimeFilter.All, AllDatesFilterButton),
+        (LibraryTimeFilter.Today, TodayFilterButton),
+        (LibraryTimeFilter.ThisWeek, ThisWeekFilterButton),
+        (LibraryTimeFilter.ThisMonth, ThisMonthFilterButton),
+        (LibraryTimeFilter.ThisYear, ThisYearFilterButton),
+        (LibraryTimeFilter.Earlier, EarlierFilterButton),
+    ];
+
+    private static string LibraryTimeFilterLabel(LibraryTimeFilter filter) => filter switch
+    {
+        LibraryTimeFilter.All => "All dates",
+        LibraryTimeFilter.Today => "Today",
+        LibraryTimeFilter.ThisWeek => "This week",
+        LibraryTimeFilter.ThisMonth => "This month",
+        LibraryTimeFilter.ThisYear => "This year",
+        LibraryTimeFilter.Earlier => "Earlier",
+        _ => throw new ArgumentOutOfRangeException(nameof(filter)),
+    };
+
+    private static string LibraryTimeFilterEmptyMessage(LibraryTimeFilter filter) => filter switch
+    {
+        LibraryTimeFilter.Today => "No photos were taken today.",
+        LibraryTimeFilter.ThisWeek => "No photos were taken this week.",
+        LibraryTimeFilter.ThisMonth => "No photos were taken this month.",
+        LibraryTimeFilter.ThisYear => "No photos were taken this year.",
+        LibraryTimeFilter.Earlier => "There are no photos from before this year.",
+        _ => "This library does not contain any photos yet.",
+    };
 
     private static PortableLibraryFile? FindExportableFile(PortableLibraryAsset asset, VariantKind variant)
     {
@@ -713,66 +1108,404 @@ public partial class MainWindow : Window
             file.IsPresent);
     }
 
-    private static IReadOnlyList<OriginalExportChoice> BuildOriginalChoices(PortableLibraryAsset asset) =>
-        asset.Files
+    internal static PortableLibraryFile? FindCopyableImageFile(PortableLibraryAsset asset)
+    {
+        ArgumentNullException.ThrowIfNull(asset);
+        if (asset.Catalog.MediaType != "photo" && !asset.IsLivePhoto)
+        {
+            return null;
+        }
+
+        var relationships = asset.Catalog.LivePhotoRelationships;
+        var candidates = new[]
+        {
+            FindExportableFile(asset, VariantKind.CurrentMaster),
+            FindFile(relationships?.CurrentStillFileId),
+            FindExportableFile(asset, VariantKind.RootOriginal),
+            FindFile(relationships?.OriginalStillFileId),
+        };
+        return candidates
+                   .OfType<PortableLibraryFile>()
+                   .DistinctBy(file => file.FileId)
+                   .FirstOrDefault(IsCopyableStillImage) ??
+               asset.Files.FirstOrDefault(IsCopyableStillImage);
+
+        PortableLibraryFile? FindFile(Guid? fileId) => fileId is { } id
+            ? asset.Files.FirstOrDefault(file => file.FileId == id)
+            : null;
+    }
+
+    internal static bool IsCopyableStillImage(PortableLibraryFile file)
+    {
+        ArgumentNullException.ThrowIfNull(file);
+        var isStillImage =
+            file.Catalog.ContentType?.StartsWith("image/", StringComparison.OrdinalIgnoreCase) == true ||
+            file.Catalog.PhotoKitResourceType is
+                "photo" or "alternatePhoto" or "fullSizePhoto" or "adjustmentBasePhoto";
+        return isStillImage &&
+               file.Catalog.Provenance == Provenance.ExactPhotoKitResource &&
+               file.Catalog.Availability == Availability.Available &&
+               file.Catalog.ByteCount is not null &&
+               file.Catalog.Sha256 is not null &&
+               file.IsPresent;
+    }
+
+    private static IReadOnlyList<LibraryVariantChoice> BuildAdditionalOriginalChoices(PortableLibraryAsset asset)
+    {
+        var primaryFileIds = new[]
+            {
+                VariantKind.CurrentMaster,
+                VariantKind.RootOriginal,
+                VariantKind.CurrentLiveMotion,
+                VariantKind.OriginalLiveMotion,
+            }
+            .Select(variant => FindExportableFile(asset, variant)?.FileId)
+            .OfType<Guid>()
+            .ToHashSet();
+        return asset.Files
             .Where(file =>
+                !primaryFileIds.Contains(file.FileId) &&
                 file.Catalog.Availability == Availability.Available &&
                 (file.Catalog.Roles.Contains(RepresentationRole.RootOriginal) ||
                  file.Catalog.Roles.Contains(RepresentationRole.AlternateOriginal)) &&
                 file.Catalog.ByteCount is not null &&
                 file.Catalog.Sha256 is not null &&
                 file.IsPresent)
-            .Select(file => new OriginalExportChoice(
-                file.Catalog.Roles.Contains(RepresentationRole.RootOriginal)
-                    ? $"{file.Catalog.OriginalFilename} (main original)"
-                    : file.Catalog.OriginalFilename,
+            .GroupBy(file => file.FileId)
+            .Select(group => group.First())
+            .OrderBy(file => file.Catalog.OriginalFilename, StringComparer.CurrentCultureIgnoreCase)
+            .Select(file => new LibraryVariantChoice(
+                $"Original — {file.Catalog.OriginalFilename}",
                 file))
             .ToArray();
+    }
 
-    private void ConfigureExportButtons(PortableLibraryAsset asset)
+    private void ConfigureVariantButtons(PortableLibraryAsset asset)
     {
-        if (isLibraryExportInProgress)
+        var candidates = new[]
         {
-            SetExportButtonsEnabled(false);
+            (VariantKind.CurrentMaster, FindExportableFile(asset, VariantKind.CurrentMaster)),
+            (VariantKind.RootOriginal, FindExportableFile(asset, VariantKind.RootOriginal)),
+            (VariantKind.CurrentLiveMotion, FindExportableFile(asset, VariantKind.CurrentLiveMotion)),
+            (VariantKind.OriginalLiveMotion, FindExportableFile(asset, VariantKind.OriginalLiveMotion)),
+        };
+        var distinctKinds = DistinctVariantKinds(candidates
+            .Where(candidate => candidate.Item2 is not null)
+            .Select(candidate => (candidate.Item1, candidate.Item2!.FileId)));
+        var visibleKinds = distinctKinds.ToHashSet();
+
+        CurrentVersionButton.IsEnabled = visibleKinds.Contains(VariantKind.CurrentMaster);
+        OriginalVersionButton.IsEnabled = visibleKinds.Contains(VariantKind.RootOriginal);
+        CurrentMotionVersionButton.IsEnabled = visibleKinds.Contains(VariantKind.CurrentLiveMotion);
+        OriginalMotionVersionButton.IsEnabled = visibleKinds.Contains(VariantKind.OriginalLiveMotion);
+        var additionalCount = IndividualOriginalsComboBox.Items.Count;
+        VersionSelectionPanel.Visibility = ShouldShowVariantSelection(distinctKinds.Count, additionalCount)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        AdditionalOriginalsPanel.Visibility =
+            VersionSelectionPanel.Visibility == Visibility.Visible && additionalCount > 0
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        SetVariantInteractionEnabled(!isLibraryExportInProgress);
+    }
+
+    internal static IReadOnlyList<VariantKind> DistinctVariantKinds(
+        IEnumerable<(VariantKind Variant, Guid FileId)> candidates)
+    {
+        ArgumentNullException.ThrowIfNull(candidates);
+        var seenFiles = new HashSet<Guid>();
+        var result = new List<VariantKind>(4);
+        foreach (var (variant, fileId) in candidates)
+        {
+            if (seenFiles.Add(fileId))
+            {
+                result.Add(variant);
+            }
+        }
+        return result;
+    }
+
+    internal static bool ShouldShowVariantSelection(int distinctVariantCount, int additionalOriginalCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(distinctVariantCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(additionalOriginalCount);
+        return distinctVariantCount + additionalOriginalCount > 1;
+    }
+
+    private void SetVariantInteractionEnabled(bool enabled)
+    {
+        foreach (var button in VariantButtons())
+        {
+            button.IsHitTestVisible = enabled;
+            button.Focusable = enabled;
+        }
+        IndividualOriginalsComboBox.IsHitTestVisible = enabled;
+        IndividualOriginalsComboBox.Focusable = enabled;
+        SaveLibraryPreviewButton.IsHitTestVisible = enabled;
+        SaveLibraryPreviewButton.Focusable = enabled;
+        CopyLibraryPreviewButton.IsHitTestVisible = enabled;
+        CopyLibraryPreviewButton.Focusable = enabled;
+        SaveLibraryPreviewButton.Content = enabled ? "Save" : "Saving…";
+    }
+
+    private RadioButton[] VariantButtons() =>
+    [
+        CurrentVersionButton,
+        OriginalVersionButton,
+        CurrentMotionVersionButton,
+        OriginalMotionVersionButton,
+    ];
+
+    private void SelectPreferredLibraryPreview(PortableLibraryAsset asset, string? thumbnailPath)
+    {
+        foreach (var variant in new[]
+                 {
+                     VariantKind.CurrentMaster,
+                     VariantKind.RootOriginal,
+                     VariantKind.CurrentLiveMotion,
+                     VariantKind.OriginalLiveMotion,
+                 })
+        {
+            if (FindExportableFile(asset, variant) is { } file)
+            {
+                SelectLibraryPreview(file, VariantLabel(variant), variant, thumbnailPath);
+                return;
+            }
+        }
+
+        if (IndividualOriginalsComboBox.Items.Count > 0 &&
+            IndividualOriginalsComboBox.Items[0] is LibraryVariantChoice choice)
+        {
+            isConfiguringLibraryVersions = true;
+            IndividualOriginalsComboBox.SelectedIndex = 0;
+            isConfiguringLibraryVersions = false;
+            SetCheckedVariant(null);
+            SelectLibraryPreview(choice.File, choice.Label, null, thumbnailPath);
             return;
         }
 
-        ExportCurrentButton.IsEnabled = FindExportableFile(asset, VariantKind.CurrentMaster) is not null;
-        ExportOriginalButton.IsEnabled = FindExportableFile(asset, VariantKind.RootOriginal) is not null;
-        ExportCurrentMotionButton.IsEnabled = FindExportableFile(asset, VariantKind.CurrentLiveMotion) is not null;
-        ExportOriginalMotionButton.IsEnabled = FindExportableFile(asset, VariantKind.OriginalLiveMotion) is not null;
-        var hasIndividualOriginal = IndividualOriginalsComboBox.Items.Count > 1 ||
-            (IndividualOriginalsComboBox.Items.Count == 1 &&
-             FindExportableFile(asset, VariantKind.RootOriginal) is null);
-        IndividualOriginalsComboBox.Visibility = hasIndividualOriginal ? Visibility.Visible : Visibility.Collapsed;
-        ExportIndividualOriginalButton.Visibility = hasIndividualOriginal ? Visibility.Visible : Visibility.Collapsed;
-        IndividualOriginalsComboBox.IsEnabled = hasIndividualOriginal;
-        ExportIndividualOriginalButton.IsEnabled = hasIndividualOriginal;
+        selectedLibraryPreviewFile = null;
+        selectedLibraryPreviewLabel = string.Empty;
+        LibraryPreviewImage.Source = LoadPreview(thumbnailPath);
+        SaveLibraryPreviewButton.Visibility = Visibility.Collapsed;
+        CopyLibraryPreviewButton.Visibility = Visibility.Collapsed;
+        ShowLibraryPreviewMessage("No saved version is available.");
+        SetCheckedVariant(null);
     }
 
-    private void SetExportButtonsEnabled(bool enabled)
+    private void SelectLibraryPreview(
+        PortableLibraryFile file,
+        string label,
+        VariantKind? variant,
+        string? thumbnailPath)
     {
-        ExportCurrentButton.IsEnabled = enabled;
-        ExportOriginalButton.IsEnabled = enabled;
-        ExportCurrentMotionButton.IsEnabled = enabled;
-        ExportOriginalMotionButton.IsEnabled = enabled;
-        IndividualOriginalsComboBox.IsEnabled = enabled;
-        ExportIndividualOriginalButton.IsEnabled = enabled;
+        CancelLibraryImagePreview();
+        StopLibraryVideoPreview();
+
+        selectedLibraryPreviewFile = file;
+        selectedLibraryPreviewLabel = label;
+        SaveLibraryPreviewButton.Visibility = Visibility.Visible;
+        CopyLibraryPreviewButton.Visibility = IsCopyableStillImage(file)
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        SaveLibraryPreviewButton.Content = "Save";
+        SaveLibraryPreviewButton.ToolTip = $"Save {label}";
+        SetCheckedVariant(variant);
+
+        var thumbnail = LoadPreview(thumbnailPath);
+        LibraryPreviewImage.Source = thumbnail;
+        ShowLibraryPreviewMessage(null);
+        if (file.AbsolutePath is not { } path)
+        {
+            ShowLibraryPreviewMessage("This version is no longer available to preview.");
+            return;
+        }
+
+        if (IsVideoPreview(file, path))
+        {
+            StartLibraryVideoPreview(path);
+            return;
+        }
+
+        var cancellation = new CancellationTokenSource();
+        libraryPreviewLoadCancellation = cancellation;
+        var revision = Interlocked.Increment(ref libraryPreviewRevision);
+        if (thumbnail is null)
+        {
+            ShowLibraryPreviewMessage("Loading preview…");
+        }
+        _ = LoadLibraryImagePreviewAsync(file.FileId, path, revision, cancellation);
+    }
+
+    private async Task LoadLibraryImagePreviewAsync(
+        Guid fileId,
+        string path,
+        long revision,
+        CancellationTokenSource cancellation)
+    {
+        try
+        {
+            var image = await ThumbnailBitmapCache.LoadAsync(path, 1200, cancellation.Token);
+            if (cancellation.IsCancellationRequested ||
+                revision != Volatile.Read(ref libraryPreviewRevision) ||
+                selectedLibraryPreviewFile?.FileId != fileId)
+            {
+                return;
+            }
+
+            if (image is not null)
+            {
+                LibraryPreviewImage.Source = image;
+                ShowLibraryPreviewMessage(null);
+            }
+            else
+            {
+                ShowLibraryPreviewMessage("Full preview unavailable — showing the library thumbnail.");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        finally
+        {
+            if (ReferenceEquals(libraryPreviewLoadCancellation, cancellation))
+            {
+                libraryPreviewLoadCancellation = null;
+                cancellation.Dispose();
+            }
+        }
+    }
+
+    private void StartLibraryVideoPreview(string path)
+    {
+        try
+        {
+            isLibraryVideoPreviewActive = true;
+            LibraryPreviewVideo.Source = new Uri(Path.GetFullPath(path), UriKind.Absolute);
+            LibraryPreviewVideo.Position = TimeSpan.Zero;
+            LibraryPreviewVideo.Visibility = Visibility.Visible;
+            ShowLibraryPreviewMessage("Loading video preview…");
+            if (IsVisible)
+            {
+                LibraryPreviewVideo.Play();
+            }
+        }
+        catch (Exception exception) when (exception is UriFormatException or IOException or UnauthorizedAccessException)
+        {
+            StopLibraryVideoPreview();
+            ShowLibraryPreviewMessage("Video preview unavailable. You can still save this version.");
+        }
+    }
+
+    private void LibraryPreviewVideo_MediaOpened(object sender, RoutedEventArgs e)
+    {
+        if (isLibraryVideoPreviewActive)
+        {
+            ShowLibraryPreviewMessage(null);
+        }
+    }
+
+    private void LibraryPreviewVideo_MediaEnded(object sender, RoutedEventArgs e)
+    {
+        if (isLibraryVideoPreviewActive && IsVisible)
+        {
+            LibraryPreviewVideo.Position = TimeSpan.Zero;
+            LibraryPreviewVideo.Play();
+        }
+    }
+
+    private void LibraryPreviewVideo_MediaFailed(object sender, ExceptionRoutedEventArgs e)
+    {
+        if (!isLibraryVideoPreviewActive)
+        {
+            return;
+        }
+
+        StopLibraryVideoPreview();
+        ShowLibraryPreviewMessage("Video preview unavailable. You can still save this version.");
+    }
+
+    private void SetCheckedVariant(VariantKind? selected)
+    {
+        foreach (var button in VariantButtons())
+        {
+            button.IsChecked = selected is not null &&
+                button.Tag is string tag &&
+                Enum.TryParse<VariantKind>(tag, out var variant) &&
+                variant == selected;
+        }
+    }
+
+    private void ShowLibraryPreviewMessage(string? message)
+    {
+        LibraryPreviewMessageText.Text = message ?? string.Empty;
+        LibraryPreviewMessageBorder.Visibility = string.IsNullOrWhiteSpace(message)
+            ? Visibility.Collapsed
+            : Visibility.Visible;
+    }
+
+    private void CancelLibraryImagePreview()
+    {
+        Interlocked.Increment(ref libraryPreviewRevision);
+        var cancellation = libraryPreviewLoadCancellation;
+        libraryPreviewLoadCancellation = null;
+        if (cancellation is null)
+        {
+            return;
+        }
+
+        cancellation.Cancel();
+        cancellation.Dispose();
+    }
+
+    private void StopLibraryVideoPreview()
+    {
+        isLibraryVideoPreviewActive = false;
+        LibraryPreviewVideo.Close();
+        LibraryPreviewVideo.Source = null;
+        LibraryPreviewVideo.Visibility = Visibility.Collapsed;
+    }
+
+    private static bool IsVideoPreview(PortableLibraryFile file, string path)
+    {
+        if (file.Catalog.ContentType?.StartsWith("video/", StringComparison.OrdinalIgnoreCase) == true ||
+            file.Catalog.PhotoKitResourceType?.Contains("video", StringComparison.OrdinalIgnoreCase) == true ||
+            file.Catalog.Roles.Any(static role =>
+                role is RepresentationRole.CurrentLiveMotion or RepresentationRole.OriginalLiveMotion))
+        {
+            return true;
+        }
+
+        return Path.GetExtension(path).ToLowerInvariant() is
+            ".mov" or ".mp4" or ".m4v" or ".avi" or ".wmv" or ".mpeg" or ".mpg";
     }
 
     private void SetLibraryInteractionEnabled(bool enabled)
     {
         LibraryAssetList.IsEnabled = enabled;
+        foreach (var (_, button) in LibraryTimeFilterButtons())
+        {
+            button.IsHitTestVisible = enabled;
+            button.Focusable = enabled;
+        }
         ReloadLibraryButton.IsEnabled = enabled;
+        OpenLibraryFolderButton.IsEnabled = enabled;
         CloseLibraryButton.IsEnabled = enabled;
         OpenMasterFolderButton.IsEnabled = enabled;
         OpenAnotherLibraryMenuItem.IsEnabled = enabled && presentation.CanOpenLibrary;
-        SetExportButtonsEnabled(enabled);
+        SetVariantInteractionEnabled(enabled);
     }
 
     private void ClearLibrarySelection(string message)
     {
+        CancelLibraryImagePreview();
+        StopLibraryVideoPreview();
+        selectedLibraryPreviewFile = null;
+        selectedLibraryPreviewLabel = string.Empty;
         LibraryPreviewImage.Source = null;
+        SaveLibraryPreviewButton.Visibility = Visibility.Collapsed;
+        CopyLibraryPreviewButton.Visibility = Visibility.Collapsed;
+        ShowLibraryPreviewMessage(null);
         LibraryFilenameText.Text = "No item selected";
         LibraryDateText.Text = string.Empty;
         LibraryFlagsText.Text = string.Empty;
@@ -780,9 +1513,13 @@ public partial class MainWindow : Window
         LibraryExportStatusText.Text = message;
         SetResourceBrush(LibraryExportStatusText, "TextSecondaryBrush");
         IndividualOriginalsComboBox.ItemsSource = null;
-        IndividualOriginalsComboBox.Visibility = Visibility.Collapsed;
-        ExportIndividualOriginalButton.Visibility = Visibility.Collapsed;
-        SetExportButtonsEnabled(false);
+        VersionSelectionPanel.Visibility = Visibility.Collapsed;
+        AdditionalOriginalsPanel.Visibility = Visibility.Collapsed;
+        foreach (var button in VariantButtons())
+        {
+            button.IsChecked = false;
+            button.IsEnabled = false;
+        }
     }
 
     private static BitmapImage? LoadPreview(string? path, int decodePixelWidth = 800)
@@ -857,7 +1594,10 @@ public partial class MainWindow : Window
         alternateLibraryPath = null;
         openedLibraryPath = null;
         openLibrary = null;
+        libraryItems = Array.Empty<LibraryAssetListItem>();
+        libraryTimeFilter = LibraryTimeFilter.All;
         LibraryAssetList.ItemsSource = null;
+        ConfigureLibraryTimeFilters(DateTimeOffset.Now);
         LibraryPreviewImage.Source = null;
         ClearLibrarySelection("Your library will reload the next time you open it.");
     }
@@ -868,6 +1608,19 @@ internal sealed record LibraryAssetListItem(
     string Filename,
     string DateText,
     string StatusText,
-    string? ThumbnailPath);
+    string? ThumbnailPath,
+    DateTimeOffset? CaptureDate);
 
-internal sealed record OriginalExportChoice(string Label, PortableLibraryFile File);
+internal sealed record LibraryVariantChoice(string Label, PortableLibraryFile File);
+
+internal sealed record PlatformClipboardImage(BitmapSource Bitmap, byte[] PngBytes);
+
+internal enum LibraryTimeFilter
+{
+    All,
+    Today,
+    ThisWeek,
+    ThisMonth,
+    ThisYear,
+    Earlier,
+}
